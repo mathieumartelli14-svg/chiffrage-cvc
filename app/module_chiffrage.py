@@ -2,7 +2,7 @@
 =============================================================================
  MODULE CHIFFRAGE CVC — SCAFFOLD
 =============================================================================
- pip install streamlit pandas fpdf2 openpyxl
+ pip install streamlit pandas fpdf2 openpyxl sqlalchemy psycopg2-binary
  streamlit run module_chiffrage.py
 
  - Bibliothèque de prix éditable (+ import/export, recherche, taux par ouvrage)
@@ -13,13 +13,13 @@
  - Bloc "Mon entreprise" + logo sur le PDF
  - PDF groupé par ensemble avec sous-totaux, mentions légales BTP
 
- NOTE déploiement : stockage local (SQLite + JSON + logo). Au déploiement,
- basculer la couche stockage sur une base persistante (Supabase / Postgres).
+ STOCKAGE : base Postgres persistante hébergée sur Supabase, atteinte via
+ SQLAlchemy. La chaîne de connexion vit dans st.secrets["DB_URL"], jamais
+ dans le code ni sur GitHub.
 =============================================================================
 """
 
 import json
-import sqlite3
 from collections import OrderedDict
 from datetime import date
 from io import BytesIO
@@ -28,6 +28,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from fpdf import FPDF
+from sqlalchemy import create_engine, text
 
 DB_PATH = Path("chiffrage.db")
 ENTREPRISE_PATH = Path("entreprise.json")
@@ -47,44 +48,44 @@ ENTREPRISE_CHAMPS = [
 
 
 # ----------------------------------------------------------------------------
-# STOCKAGE
+# STOCKAGE  (Supabase / Postgres via SQLAlchemy)
 # ----------------------------------------------------------------------------
-def _ensure_column(con, table, col, coltype):
-    cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
-    if col not in cols:
-        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+@st.cache_resource
+def get_engine():
+    # Crée la connexion à Supabase une seule fois et la garde en mémoire.
+    # pool_pre_ping évite les erreurs quand l'appli se réveille après veille.
+    return create_engine(st.secrets["DB_URL"], pool_pre_ping=True)
 
 
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""CREATE TABLE IF NOT EXISTS ouvrages (
-        code TEXT, designation TEXT, unite TEXT,
-        prix_fourniture REAL, temps_mo REAL, nb_poseurs REAL, taux_horaire REAL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS ensembles (nom TEXT, designation TEXT, quantite REAL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS clients (
-        nom TEXT, adresse TEXT, telephone TEXT, email TEXT, siret TEXT)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS devis (
-        numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
-        date_debut TEXT, duree TEXT, marge_pct REAL, tva_pct REAL, lignes_json TEXT)""")
-    # migrations douces pour les anciennes bases
-    _ensure_column(con, "ouvrages", "taux_horaire", "REAL")
-    _ensure_column(con, "devis", "statut", "TEXT")
-    con.commit()
-    con.close()
+    eng = get_engine()
+    with eng.begin() as con:
+        con.execute(text("""CREATE TABLE IF NOT EXISTS ouvrages (
+            code TEXT, designation TEXT, unite TEXT,
+            prix_fourniture DOUBLE PRECISION, temps_mo DOUBLE PRECISION,
+            nb_poseurs DOUBLE PRECISION, taux_horaire DOUBLE PRECISION)"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS ensembles (
+            nom TEXT, designation TEXT, quantite DOUBLE PRECISION)"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS clients (
+            nom TEXT, adresse TEXT, telephone TEXT, email TEXT, siret TEXT)"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS devis (
+            numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
+            date_debut TEXT, duree TEXT, marge_pct DOUBLE PRECISION,
+            tva_pct DOUBLE PRECISION, lignes_json TEXT, statut TEXT)"""))
 
 
 def _lire(table, cols):
-    con = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(f"SELECT * FROM {table}", con)
-    con.close()
+    eng = get_engine()
+    try:
+        df = pd.read_sql_query(f"SELECT * FROM {table}", eng)
+    except Exception:
+        return pd.DataFrame(columns=cols)
     return df if not df.empty else pd.DataFrame(columns=cols)
 
 
 def _ecrire(table, df):
-    con = sqlite3.connect(DB_PATH)
-    df.to_sql(table, con, if_exists="replace", index=False)
-    con.commit()
-    con.close()
+    eng = get_engine()
+    df.to_sql(table, eng, if_exists="replace", index=False)
 
 
 def charger_bibliotheque():
@@ -334,6 +335,7 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     pdf.cell(0, 5, "Date et signature du client :", ln=True)
     return bytes(pdf.output())
 
+
 def check_password():
     def password_entered():
         if st.session_state["password"] == st.secrets["ACCESS_CODE"]:
@@ -349,6 +351,8 @@ def check_password():
     if st.session_state.get("password_ok") is False:
         st.error("Code incorrect.")
     return False
+
+
 # ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
