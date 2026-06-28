@@ -334,12 +334,28 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     pdf.cell(0, 5, "Date et signature du client :", ln=True)
     return bytes(pdf.output())
 
+def check_password():
+    def password_entered():
+        if st.session_state["password"] == st.secrets["ACCESS_CODE"]:
+            st.session_state["password_ok"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_ok"] = False
 
+    if st.session_state.get("password_ok"):
+        return True
+    st.text_input("Code d'accès", type="password",
+                  on_change=password_entered, key="password")
+    if st.session_state.get("password_ok") is False:
+        st.error("Code incorrect.")
+    return False
 # ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Chiffrage CVC", layout="wide")
+    if not check_password():
+        st.stop()
     init_db()
     if "devis_lignes" not in st.session_state:
         st.session_state.devis_lignes = []
