@@ -52,10 +52,12 @@ ENTREPRISE_CHAMPS = [
 # ----------------------------------------------------------------------------
 @st.cache_resource
 def get_engine():
-    # Crée la connexion à Supabase une seule fois et la garde en mémoire.
-    # pool_pre_ping évite les erreurs quand l'appli se réveille après veille.
-    return create_engine(st.secrets["DB_URL"], pool_pre_ping=True)
-
+    db = st.secrets["db"]
+    url = (
+        f"postgresql+psycopg2://{db['user']}:{db['password']}"
+        f"@{db['host']}:{db['port']}/{db['dbname']}"
+    )
+    return create_engine(url, pool_pre_ping=True)
 
 def init_db():
     eng = get_engine()
