@@ -20,8 +20,10 @@
 """
 
 import json
+import hashlib                      
+import secrets as pysecrets         
 from collections import OrderedDict
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -74,6 +76,7 @@ def init_db():
             numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
             date_debut TEXT, duree TEXT, marge_pct DOUBLE PRECISION,
             tva_pct DOUBLE PRECISION, lignes_json TEXT, statut TEXT)"""))
+    init_utilisateurs()
 
 
 def _lire(table, cols):
@@ -338,21 +341,231 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     return bytes(pdf.output())
 
 
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == st.secrets["ACCESS_CODE"]:
-            st.session_state["password_ok"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_ok"] = False
+# -----------------------------------------------------------------------------
+# BLOC 2 — hachage des mots de passe (PBKDF2, aucune dépendance externe)
+# -----------------------------------------------------------------------------
+_ITERATIONS = 200_000
+ 
+def hacher_mdp(mot_de_passe: str) -> str:
+    """Transforme un mot de passe en empreinte irréversible : sel$hash."""
+    sel = pysecrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel.encode(), _ITERATIONS)
+    return f"{sel}${h.hex()}"
+ 
+ 
+def verifier_mdp(mot_de_passe: str, empreinte: str) -> bool:
+    """Vérifie un mot de passe contre l'empreinte stockée en base."""
+    try:
+        sel, attendu = empreinte.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel.encode(), _ITERATIONS)
+    # comparaison à temps constant (évite de révéler le mdp par le temps de réponse)
+    return pysecrets.compare_digest(h.hex(), attendu)
+ 
+ 
+def generer_mdp(longueur: int = 12) -> str:
+    """Génère un mot de passe lisible (lettres + chiffres, pas de symboles)."""
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(pysecrets.choice(alphabet) for _ in range(longueur))
+ 
+ 
+# -----------------------------------------------------------------------------
+# BLOC 3 — gestion des comptes en base
+# -----------------------------------------------------------------------------
+def init_utilisateurs():
+    """Crée la table utilisateurs si elle n'existe pas."""
+    eng = get_engine()
+    with eng.begin() as con:
+        con.execute(text("""CREATE TABLE IF NOT EXISTS utilisateurs (
+            identifiant TEXT PRIMARY KEY,
+            mdp_hash TEXT NOT NULL,
+            actif BOOLEAN DEFAULT TRUE,
+            date_creation TEXT)"""))
+ 
+ 
+def lister_utilisateurs():
+    """Retourne la liste des identifiants (jamais les mots de passe)."""
+    eng = get_engine()
+    try:
+        with eng.begin() as con:
+            rows = con.execute(text(
+                "SELECT identifiant, actif, date_creation FROM utilisateurs ORDER BY identifiant"
+            )).fetchall()
+        return [{"identifiant": r[0], "actif": r[1], "date_creation": r[2]} for r in rows]
+    except Exception:
+        return []
+ 
+ 
+def creer_utilisateur(identifiant: str, mot_de_passe: str) -> bool:
+    """Crée un compte. Retourne False si l'identifiant existe déjà."""
+    identifiant = (identifiant or "").strip().lower()
+    if not identifiant or not mot_de_passe:
+        return False
+    eng = get_engine()
+    with eng.begin() as con:
+        existe = con.execute(
+            text("SELECT 1 FROM utilisateurs WHERE identifiant = :i"),
+            {"i": identifiant}).fetchone()
+        if existe:
+            return False
+        con.execute(text("""INSERT INTO utilisateurs
+            (identifiant, mdp_hash, actif, date_creation)
+            VALUES (:i, :h, TRUE, :d)"""),
+            {"i": identifiant, "h": hacher_mdp(mot_de_passe),
+             "d": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    return True
+ 
+ 
+def reinitialiser_mdp(identifiant: str) -> str | None:
+    """Génère un nouveau mot de passe pour un compte. Retourne le mdp en clair
+    UNE SEULE FOIS (à transmettre au client), ou None si le compte n'existe pas."""
+    identifiant = (identifiant or "").strip().lower()
+    nouveau = generer_mdp()
+    eng = get_engine()
+    with eng.begin() as con:
+        res = con.execute(text("UPDATE utilisateurs SET mdp_hash = :h WHERE identifiant = :i"),
+                          {"h": hacher_mdp(nouveau), "i": identifiant})
+        if res.rowcount == 0:
+            return None
+    return nouveau
+ 
+ 
+def changer_mdp(identifiant: str, ancien: str, nouveau: str) -> bool:
+    """Permet à un utilisateur connecté de changer lui-même son mot de passe."""
+    identifiant = (identifiant or "").strip().lower()
+    eng = get_engine()
+    with eng.begin() as con:
+        row = con.execute(text("SELECT mdp_hash FROM utilisateurs WHERE identifiant = :i"),
+                          {"i": identifiant}).fetchone()
+        if not row or not verifier_mdp(ancien, row[0]):
+            return False
+        con.execute(text("UPDATE utilisateurs SET mdp_hash = :h WHERE identifiant = :i"),
+                    {"h": hacher_mdp(nouveau), "i": identifiant})
+    return True
+ 
+ 
+def desactiver_utilisateur(identifiant: str, actif: bool):
+    """Coupe (ou rétablit) l'accès d'un compte sans le supprimer."""
+    eng = get_engine()
+    with eng.begin() as con:
+        con.execute(text("UPDATE utilisateurs SET actif = :a WHERE identifiant = :i"),
+                    {"a": actif, "i": (identifiant or "").strip().lower()})
+ 
+ 
+def authentifier(identifiant: str, mot_de_passe: str) -> bool:
+    """Vérifie un couple identifiant/mot de passe contre la base."""
+    identifiant = (identifiant or "").strip().lower()
+    eng = get_engine()
+    try:
+        with eng.begin() as con:
+            row = con.execute(
+                text("SELECT mdp_hash, actif FROM utilisateurs WHERE identifiant = :i"),
+                {"i": identifiant}).fetchone()
+    except Exception:
+        return False
+    if not row or not row[1]:          # compte inexistant ou désactivé
+        return False
+    return verifier_mdp(mot_de_passe, row[0])
 
-    if st.session_state.get("password_ok"):
+def check_password():
+    def credentials_entered():
+        u = st.session_state.get("login_user", "")
+        p = st.session_state.get("login_pass", "")
+ 
+        # 1) Accès ADMIN (toi) : tes secrets actuels, inchangés
+        if u == st.secrets["APP_USER"] and p == st.secrets["APP_PASSWORD"]:
+            st.session_state["auth_ok"] = True
+            st.session_state["is_admin"] = True
+            st.session_state["user"] = u
+            st.session_state.pop("login_pass", None)
+            return
+ 
+        # 2) Accès CLIENT : compte en base, mot de passe haché
+        if authentifier(u, p):
+            st.session_state["auth_ok"] = True
+            st.session_state["is_admin"] = False
+            st.session_state["user"] = u.strip().lower()
+            st.session_state.pop("login_pass", None)
+            return
+ 
+        st.session_state["auth_ok"] = False
+ 
+    if st.session_state.get("auth_ok"):
         return True
-    st.text_input("Code d'accès", type="password",
-                  on_change=password_entered, key="password")
-    if st.session_state.get("password_ok") is False:
-        st.error("Code incorrect.")
+ 
+    st.subheader("Connexion")
+    st.text_input("Identifiant", key="login_user")
+    st.text_input("Mot de passe", type="password", key="login_pass")
+    st.button("Se connecter", on_click=credentials_entered)
+    if st.session_state.get("auth_ok") is False:
+        st.error("Identifiant ou mot de passe incorrect.")
+    st.caption("Mot de passe oublié ? Contacte l'administrateur pour le réinitialiser.")
     return False
+ 
+ 
+# -----------------------------------------------------------------------------
+# BLOC 5 — panneau ADMIN + changement de mdp (à appeler dans main(), sidebar)
+# -----------------------------------------------------------------------------
+def panneau_comptes():
+    """À placer dans la sidebar de main(), après check_password()."""
+ 
+    # --- visible par tout le monde : changer son propre mot de passe ---
+    if not st.session_state.get("is_admin"):
+        with st.sidebar.expander("🔑 Changer mon mot de passe"):
+            a = st.text_input("Mot de passe actuel", type="password", key="chg_old")
+            n1 = st.text_input("Nouveau mot de passe", type="password", key="chg_n1")
+            n2 = st.text_input("Confirmer", type="password", key="chg_n2")
+            if st.button("Valider le changement"):
+                if len(n1) < 8:
+                    st.error("8 caractères minimum.")
+                elif n1 != n2:
+                    st.error("Les deux saisies ne correspondent pas.")
+                elif changer_mdp(st.session_state.get("user"), a, n1):
+                    st.success("Mot de passe modifié.")
+                else:
+                    st.error("Mot de passe actuel incorrect.")
+        return
+ 
+    # --- réservé à l'admin (toi) ---
+    with st.sidebar.expander("👤 Gestion des comptes (admin)"):
+        st.caption("Crée un compte par client. Le mot de passe n'est affiché qu'une fois.")
+ 
+        st.markdown("**Créer un compte**")
+        new_id = st.text_input("Identifiant du client", key="adm_id")
+        if st.button("Créer le compte"):
+            if not new_id.strip():
+                st.error("Donne un identifiant.")
+            else:
+                mdp = generer_mdp()
+                if creer_utilisateur(new_id, mdp):
+                    st.success(f"Compte « {new_id.strip().lower()} » créé.")
+                    st.code(mdp, language=None)
+                    st.warning("Note ce mot de passe MAINTENANT et transmets-le au client "
+                               "par un canal sûr. Il ne sera plus affiché.")
+                else:
+                    st.error("Cet identifiant existe déjà.")
+ 
+        st.divider()
+        st.markdown("**Réinitialiser un mot de passe**")
+        comptes = [u["identifiant"] for u in lister_utilisateurs()]
+        if not comptes:
+            st.caption("Aucun compte client pour l'instant.")
+        else:
+            cible = st.selectbox("Compte", comptes, key="adm_reset")
+            if st.button("Générer un nouveau mot de passe"):
+                nouveau = reinitialiser_mdp(cible)
+                if nouveau:
+                    st.success(f"Nouveau mot de passe pour « {cible} » :")
+                    st.code(nouveau, language=None)
+                    st.warning("Transmets-le au client. Il ne sera plus affiché.")
+                else:
+                    st.error("Compte introuvable.")
+ 
+            st.divider()
+            st.markdown("**Comptes existants**")
+            st.dataframe(pd.DataFrame(lister_utilisateurs()), use_container_width=True,
+                         hide_index=True)
 
 
 # ----------------------------------------------------------------------------
@@ -371,6 +584,7 @@ def main():
     st.title("Module chiffrage CVC")
 
     with st.sidebar:
+        panneau_comptes()
         st.header("Réglages généraux")
         taux_horaire = st.number_input("Taux horaire par défaut (€/h)", min_value=0.0, value=45.0, step=1.0)
         st.caption("Taux par défaut. Tu peux en fixer un par ouvrage dans la biblio. "
