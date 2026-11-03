@@ -2,26 +2,11 @@
 =============================================================================
  MODULE CHIFFRAGE CVC — SCAFFOLD
 =============================================================================
- pip install streamlit pandas fpdf2 openpyxl sqlalchemy psycopg2-binary
- streamlit run module_chiffrage.py
-
- - Bibliothèque de prix éditable (+ import/export, recherche, taux par ouvrage)
- - Ouvrages composés (ensembles)
- - Base clients
- - Devis : numérotation auto sans doublon, sauvegarde, duplication, statut
- - Suivi des devis (statut En attente / Accepté / Refusé) + export Excel
- - Bloc "Mon entreprise" + logo sur le PDF
- - PDF groupé par ensemble avec sous-totaux, mentions légales BTP
-
- STOCKAGE : base Postgres persistante hébergée sur Supabase, atteinte via
- SQLAlchemy. La chaîne de connexion vit dans st.secrets["DB_URL"], jamais
- dans le code ni sur GitHub.
-=============================================================================
 """
 
 import json
-import hashlib                      
-import secrets as pysecrets         
+import hashlib
+import secrets as pysecrets
 from collections import OrderedDict
 from datetime import date, datetime
 from io import BytesIO
@@ -60,6 +45,7 @@ def get_engine():
         f"@{db['host']}:{db['port']}/{db['dbname']}"
     )
     return create_engine(url, pool_pre_ping=True)
+
 
 def init_db():
     eng = get_engine()
@@ -234,7 +220,6 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     def euro(x):
         return f"{x:,.2f} EUR".replace(",", " ")
 
-    # Logo (haut droite) si présent
     if LOGO_PATH.exists():
         try:
             pdf.image(str(LOGO_PATH), x=150, y=8, w=45)
@@ -342,39 +327,35 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
 
 
 # -----------------------------------------------------------------------------
-# BLOC 2 — hachage des mots de passe (PBKDF2, aucune dépendance externe)
+# AUTH — hachage des mots de passe (PBKDF2)
 # -----------------------------------------------------------------------------
 _ITERATIONS = 200_000
- 
+
+
 def hacher_mdp(mot_de_passe: str) -> str:
-    """Transforme un mot de passe en empreinte irréversible : sel$hash."""
     sel = pysecrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel.encode(), _ITERATIONS)
     return f"{sel}${h.hex()}"
- 
- 
+
+
 def verifier_mdp(mot_de_passe: str, empreinte: str) -> bool:
-    """Vérifie un mot de passe contre l'empreinte stockée en base."""
     try:
         sel, attendu = empreinte.split("$", 1)
     except (ValueError, AttributeError):
         return False
     h = hashlib.pbkdf2_hmac("sha256", mot_de_passe.encode(), sel.encode(), _ITERATIONS)
-    # comparaison à temps constant (évite de révéler le mdp par le temps de réponse)
     return pysecrets.compare_digest(h.hex(), attendu)
- 
- 
+
+
 def generer_mdp(longueur: int = 12) -> str:
-    """Génère un mot de passe lisible (lettres + chiffres, pas de symboles)."""
     alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(pysecrets.choice(alphabet) for _ in range(longueur))
- 
- 
+
+
 # -----------------------------------------------------------------------------
-# BLOC 3 — gestion des comptes en base
+# AUTH — gestion des comptes en base
 # -----------------------------------------------------------------------------
 def init_utilisateurs():
-    """Crée la table utilisateurs si elle n'existe pas."""
     eng = get_engine()
     with eng.begin() as con:
         con.execute(text("""CREATE TABLE IF NOT EXISTS utilisateurs (
@@ -382,10 +363,9 @@ def init_utilisateurs():
             mdp_hash TEXT NOT NULL,
             actif BOOLEAN DEFAULT TRUE,
             date_creation TEXT)"""))
- 
- 
+
+
 def lister_utilisateurs():
-    """Retourne la liste des identifiants (jamais les mots de passe)."""
     eng = get_engine()
     try:
         with eng.begin() as con:
@@ -395,10 +375,9 @@ def lister_utilisateurs():
         return [{"identifiant": r[0], "actif": r[1], "date_creation": r[2]} for r in rows]
     except Exception:
         return []
- 
- 
+
+
 def creer_utilisateur(identifiant: str, mot_de_passe: str) -> bool:
-    """Crée un compte. Retourne False si l'identifiant existe déjà."""
     identifiant = (identifiant or "").strip().lower()
     if not identifiant or not mot_de_passe:
         return False
@@ -415,11 +394,9 @@ def creer_utilisateur(identifiant: str, mot_de_passe: str) -> bool:
             {"i": identifiant, "h": hacher_mdp(mot_de_passe),
              "d": datetime.now().strftime("%Y-%m-%d %H:%M")})
     return True
- 
- 
-def reinitialiser_mdp(identifiant: str) -> str | None:
-    """Génère un nouveau mot de passe pour un compte. Retourne le mdp en clair
-    UNE SEULE FOIS (à transmettre au client), ou None si le compte n'existe pas."""
+
+
+def reinitialiser_mdp(identifiant: str):
     identifiant = (identifiant or "").strip().lower()
     nouveau = generer_mdp()
     eng = get_engine()
@@ -429,10 +406,9 @@ def reinitialiser_mdp(identifiant: str) -> str | None:
         if res.rowcount == 0:
             return None
     return nouveau
- 
- 
+
+
 def changer_mdp(identifiant: str, ancien: str, nouveau: str) -> bool:
-    """Permet à un utilisateur connecté de changer lui-même son mot de passe."""
     identifiant = (identifiant or "").strip().lower()
     eng = get_engine()
     with eng.begin() as con:
@@ -443,18 +419,16 @@ def changer_mdp(identifiant: str, ancien: str, nouveau: str) -> bool:
         con.execute(text("UPDATE utilisateurs SET mdp_hash = :h WHERE identifiant = :i"),
                     {"h": hacher_mdp(nouveau), "i": identifiant})
     return True
- 
- 
+
+
 def desactiver_utilisateur(identifiant: str, actif: bool):
-    """Coupe (ou rétablit) l'accès d'un compte sans le supprimer."""
     eng = get_engine()
     with eng.begin() as con:
         con.execute(text("UPDATE utilisateurs SET actif = :a WHERE identifiant = :i"),
                     {"a": actif, "i": (identifiant or "").strip().lower()})
- 
- 
+
+
 def authentifier(identifiant: str, mot_de_passe: str) -> bool:
-    """Vérifie un couple identifiant/mot de passe contre la base."""
     identifiant = (identifiant or "").strip().lower()
     eng = get_engine()
     try:
@@ -464,36 +438,32 @@ def authentifier(identifiant: str, mot_de_passe: str) -> bool:
                 {"i": identifiant}).fetchone()
     except Exception:
         return False
-    if not row or not row[1]:          # compte inexistant ou désactivé
+    if not row or not row[1]:
         return False
     return verifier_mdp(mot_de_passe, row[0])
+
 
 def check_password():
     def credentials_entered():
         u = st.session_state.get("login_user", "")
         p = st.session_state.get("login_pass", "")
- 
-        # 1) Accès ADMIN (toi) : tes secrets actuels, inchangés
         if u == st.secrets["APP_USER"] and p == st.secrets["APP_PASSWORD"]:
             st.session_state["auth_ok"] = True
             st.session_state["is_admin"] = True
             st.session_state["user"] = u
             st.session_state.pop("login_pass", None)
             return
- 
-        # 2) Accès CLIENT : compte en base, mot de passe haché
         if authentifier(u, p):
             st.session_state["auth_ok"] = True
             st.session_state["is_admin"] = False
             st.session_state["user"] = u.strip().lower()
             st.session_state.pop("login_pass", None)
             return
- 
         st.session_state["auth_ok"] = False
- 
+
     if st.session_state.get("auth_ok"):
         return True
- 
+
     st.subheader("Connexion")
     st.text_input("Identifiant", key="login_user")
     st.text_input("Mot de passe", type="password", key="login_pass")
@@ -502,15 +472,9 @@ def check_password():
         st.error("Identifiant ou mot de passe incorrect.")
     st.caption("Mot de passe oublié ? Contacte l'administrateur pour le réinitialiser.")
     return False
- 
- 
-# -----------------------------------------------------------------------------
-# BLOC 5 — panneau ADMIN + changement de mdp (à appeler dans main(), sidebar)
-# -----------------------------------------------------------------------------
+
+
 def panneau_comptes():
-    """À placer dans la sidebar de main(), après check_password()."""
- 
-    # --- visible par tout le monde : changer son propre mot de passe ---
     if not st.session_state.get("is_admin"):
         with st.sidebar.expander("🔑 Changer mon mot de passe"):
             a = st.text_input("Mot de passe actuel", type="password", key="chg_old")
@@ -526,11 +490,9 @@ def panneau_comptes():
                 else:
                     st.error("Mot de passe actuel incorrect.")
         return
- 
-    # --- réservé à l'admin (toi) ---
+
     with st.sidebar.expander("👤 Gestion des comptes (admin)"):
         st.caption("Crée un compte par client. Le mot de passe n'est affiché qu'une fois.")
- 
         st.markdown("**Créer un compte**")
         new_id = st.text_input("Identifiant du client", key="adm_id")
         if st.button("Créer le compte"):
@@ -545,7 +507,7 @@ def panneau_comptes():
                                "par un canal sûr. Il ne sera plus affiché.")
                 else:
                     st.error("Cet identifiant existe déjà.")
- 
+
         st.divider()
         st.markdown("**Réinitialiser un mot de passe**")
         comptes = [u["identifiant"] for u in lister_utilisateurs()]
@@ -561,7 +523,6 @@ def panneau_comptes():
                     st.warning("Transmets-le au client. Il ne sera plus affiché.")
                 else:
                     st.error("Compte introuvable.")
- 
             st.divider()
             st.markdown("**Comptes existants**")
             st.dataframe(pd.DataFrame(lister_utilisateurs()), use_container_width=True,
@@ -768,10 +729,14 @@ def main():
                 qte = c2.number_input("Quantité", min_value=0.0, value=1.0, step=1.0)
                 if c3.button("➕ Ajouter", use_container_width=True):
                     o = biblio.loc[choix].to_dict()
-                    pu = prix_unitaire(o, taux_horaire)
+                    fourn = o.get("prix_fourniture") or 0
+                    mo = prix_mo(o.get("temps_mo"), o.get("nb_poseurs"),
+                                 o.get("taux_horaire") or taux_horaire)
+                    pu = fourn + mo
                     st.session_state.devis_lignes.append(
                         {"groupe": "", "designation": o["designation"], "unite": o["unite"],
-                         "quantite": qte, "prix_unitaire": pu, "montant_ht": pu * qte})
+                         "quantite": qte, "prix_fourniture": fourn, "mo_unit": mo, "mo_active": True,
+                         "prix_unitaire": pu, "montant_ht": pu * qte})
                     st.rerun()
         else:
             ens_all = charger_ensembles()
@@ -788,29 +753,59 @@ def main():
                         if match.empty:
                             continue
                         o = match.iloc[0].to_dict()
-                        pu = prix_unitaire(o, taux_horaire)
+                        fourn = o.get("prix_fourniture") or 0
+                        mo = prix_mo(o.get("temps_mo"), o.get("nb_poseurs"),
+                                     o.get("taux_horaire") or taux_horaire)
+                        pu = fourn + mo
                         q = (c["quantite"] or 0) * qte_ens
                         st.session_state.devis_lignes.append(
                             {"groupe": nom_ens, "designation": o["designation"], "unite": o["unite"],
-                             "quantite": q, "prix_unitaire": pu, "montant_ht": pu * q})
+                             "quantite": q, "prix_fourniture": fourn, "mo_unit": mo, "mo_active": True,
+                             "prix_unitaire": pu, "montant_ht": pu * q})
                     st.rerun()
 
         if st.session_state.devis_lignes:
             st.subheader("Lignes du devis (modifiables, supprimables)")
-            df = pd.DataFrame(st.session_state.devis_lignes)[
-                ["groupe", "designation", "unite", "quantite", "prix_unitaire", "montant_ht"]]
+            mo_generale = st.checkbox(
+                "Appliquer la main-d'œuvre sur ce devis", value=True,
+                help="Décoché = fourniture seule sur tout le devis (aucune MO comptée).")
+
+            cols_ordre = ["groupe", "designation", "unite", "quantite",
+                          "prix_fourniture", "mo_unit", "mo_active", "prix_unitaire", "montant_ht"]
+            dfl = pd.DataFrame(st.session_state.devis_lignes)
+            for c in cols_ordre:
+                if c not in dfl.columns:
+                    if c == "mo_active":
+                        dfl[c] = True
+                    elif c in ("prix_fourniture", "mo_unit"):
+                        dfl[c] = 0.0
+                    else:
+                        dfl[c] = None
+            dff = dfl[cols_ordre]
+
             edited = st.data_editor(
-                df, num_rows="dynamic", use_container_width=True,
+                dff, num_rows="dynamic", use_container_width=True,
                 column_config={
                     "groupe": st.column_config.TextColumn("Ensemble", disabled=True),
-                    "designation": st.column_config.TextColumn("Désignation", disabled=True),
-                    "unite": st.column_config.TextColumn("Unité", disabled=True),
+                    "designation": st.column_config.TextColumn("Désignation"),
+                    "unite": st.column_config.TextColumn("Unité"),
                     "quantite": st.column_config.NumberColumn("Qté"),
+                    "prix_fourniture": st.column_config.NumberColumn("Fourniture (€)", format="%.2f"),
+                    "mo_unit": st.column_config.NumberColumn("MO unit. (€)", format="%.2f",
+                                                             help="Coût main-d'œuvre d'une unité de cette ligne."),
+                    "mo_active": st.column_config.CheckboxColumn("MO",
+                                                                 help="Coché = la main-d'œuvre est comptée sur cette ligne."),
                     "prix_unitaire": st.column_config.NumberColumn("PU HT", format="%.2f", disabled=True),
                     "montant_ht": st.column_config.NumberColumn("Montant HT", format="%.2f", disabled=True)},
                 key="editeur_devis")
+
             edited = edited[edited["designation"].notna()].copy()
             edited["quantite"] = edited["quantite"].fillna(0)
+            edited["prix_fourniture"] = edited["prix_fourniture"].fillna(0)
+            edited["mo_unit"] = edited["mo_unit"].fillna(0)
+            edited["mo_active"] = edited["mo_active"].fillna(True)
+            mo_appliquee = edited["mo_active"] & mo_generale
+            edited["prix_unitaire"] = edited["prix_fourniture"] + edited["mo_unit"].where(mo_appliquee, 0)
             edited["montant_ht"] = edited["quantite"] * edited["prix_unitaire"]
             st.session_state.devis_lignes = edited.to_dict("records")
 
@@ -890,7 +885,6 @@ def main():
                                "suivi_devis.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # Re-télécharger le PDF d'un devis enregistré
             st.divider()
             st.markdown("**Re-télécharger un devis en PDF**")
             libelles_s = {r["numero"]: f"{r['numero']} — {r['client_nom'] or ''} — {r['date_devis']}"
@@ -917,7 +911,6 @@ def main():
             st.download_button("📄 Télécharger ce devis (PDF)", pdf_rec, f"{sel_pdf}.pdf",
                                "application/pdf", key="suivi_pdf_dl")
 
-            # Petit récap
             st.caption(
                 f"En attente : {(saved['statut']=='En attente').sum()}  |  "
                 f"Acceptés : {(saved['statut']=='Accepté').sum()}  |  "
