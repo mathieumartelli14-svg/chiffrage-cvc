@@ -846,6 +846,8 @@ def main():
         client_adresse = col4.text_area("Adresse du client", key="f_client_adresse", height=80)
         date_debut = col5.text_input("Début des travaux", key="f_date_debut")
         duree = col6.text_input("Durée estimée", key="f_duree")
+        objet = st.text_input("Objet du devis", key="f_objet",
+                              placeholder="Ex. Chiffrage réseau de gaines (CVC)")
 
         st.divider()
         type_ajout = st.radio("Ajouter :", ["Un ouvrage", "Un ensemble"], horizontal=True)
@@ -958,9 +960,14 @@ def main():
 
             totaux = {"sous_total_ht": sous_total_ht, "marge_pct": marge_pct, "total_ht": total_ht,
                       "tva_pct": tva_pct, "montant_tva": montant_tva, "total_ttc": total_ttc}
+            vj = str(ent.get("validite_jours") or "").strip()
+            validite = ((date_devis + timedelta(days=int(vj))).strftime("%d/%m/%Y")
+                        if vj.isdigit() else None)
             infos = {"numero": st.session_state.numero_courant, "client": client_nom,
-                     "client_adresse": client_adresse, "date": str(date_devis),
-                     "validite_jours": ent.get("validite_jours"), "date_debut": date_debut, "duree": duree}
+                     "client_adresse": client_adresse, "client_tel": "",
+                     "date": date_devis.strftime("%d/%m/%Y"), "validite": validite,
+                     "validite_jours": ent.get("validite_jours"), "objet": objet,
+                     "date_debut": date_debut, "duree": duree}
 
             colA, colB, colC = st.columns(3)
             if colA.button("💾 Enregistrer ce devis"):
@@ -981,13 +988,9 @@ def main():
             colB.download_button("📄 Télécharger le devis (PDF)", pdf_bytes,
                                  f"{infos['numero']}.pdf", "application/pdf")
 
-            # Export Excel du devis (lignes) — le client le retravaille de son côté
-            df_devis = pd.DataFrame(st.session_state.devis_lignes)
-            cols_xl = ["groupe", "designation", "unite", "quantite", "prix_unitaire", "montant_ht"]
-            df_xl = df_devis[[c for c in cols_xl if c in df_devis.columns]].rename(columns={
-                "groupe": "Ensemble", "designation": "Désignation", "unite": "Unité",
-                "quantite": "Quantité", "prix_unitaire": "PU HT (€)", "montant_ht": "Montant HT (€)"})
-            colC.download_button("📊 Exporter ce devis (Excel)", to_excel_bytes(df_xl),
+            # Export Excel du devis mis en forme (une page) — le client le retravaille de son côté
+            xls_bytes = generer_excel_devis(ent, infos, st.session_state.devis_lignes, totaux)
+            colC.download_button("📊 Exporter ce devis (Excel)", xls_bytes,
                                  f"{infos['numero']}.xlsx",
                                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             if st.button("🗑️ Vider le devis"):
