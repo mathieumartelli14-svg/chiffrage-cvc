@@ -829,7 +829,7 @@ def main():
                      "client_adresse": client_adresse, "date": str(date_devis),
                      "validite_jours": ent.get("validite_jours"), "date_debut": date_debut, "duree": duree}
 
-            colA, colB = st.columns(2)
+            colA, colB, colC = st.columns(3)
             if colA.button("💾 Enregistrer ce devis"):
                 record = {"numero": st.session_state.numero_courant, "date_devis": str(date_devis),
                           "client_nom": client_nom, "client_adresse": client_adresse,
@@ -847,6 +847,16 @@ def main():
             pdf_bytes = generer_pdf_devis(ent, infos, st.session_state.devis_lignes, totaux)
             colB.download_button("📄 Télécharger le devis (PDF)", pdf_bytes,
                                  f"{infos['numero']}.pdf", "application/pdf")
+
+            # Export Excel du devis (lignes) — le client le retravaille de son côté
+            df_devis = pd.DataFrame(st.session_state.devis_lignes)
+            cols_xl = ["groupe", "designation", "unite", "quantite", "prix_unitaire", "montant_ht"]
+            df_xl = df_devis[[c for c in cols_xl if c in df_devis.columns]].rename(columns={
+                "groupe": "Ensemble", "designation": "Désignation", "unite": "Unité",
+                "quantite": "Quantité", "prix_unitaire": "PU HT (€)", "montant_ht": "Montant HT (€)"})
+            colC.download_button("📊 Exporter ce devis (Excel)", to_excel_bytes(df_xl),
+                                 f"{infos['numero']}.xlsx",
+                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             if st.button("🗑️ Vider le devis"):
                 st.session_state.devis_lignes = []
                 st.rerun()
