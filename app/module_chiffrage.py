@@ -8,7 +8,7 @@ import json
 import hashlib
 import secrets as pysecrets
 from collections import OrderedDict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -167,6 +167,139 @@ def to_excel_bytes(df) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
+    return buf.getvalue()
+
+
+def generer_excel_devis(entreprise, infos, lignes, totaux) -> bytes:
+    """Devis Excel mis en forme (en-tête société, destinataire, tableau, totaux),
+    calibré pour tenir sur une seule page A4 à l'impression / l'export PDF."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    NAVY = "1F3864"
+    HEADER_FILL = "2E5B8C"
+    BOX_FILL = "DCE6F1"
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Devis"
+    for col, w in {"A": 46, "B": 9, "C": 9, "D": 14, "E": 16}.items():
+        ws.column_dimensions[col].width = w
+
+    def sc(ref, value, *, font=None, fill=None, align=None, border_=None, wrap=False):
+        c = ws[ref]
+        c.value = value
+        if font:
+            c.font = font
+        if fill:
+            c.fill = PatternFill("solid", fgColor=fill)
+        if align or wrap:
+            c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+        if border_:
+            c.border = border_
+        return c
+
+    r = 1
+    sc(f"A{r}", entreprise.get("raison_sociale") or "Mon entreprise",
+       font=Font(bold=True, size=15, color=NAVY))
+    sc(f"D{r}", "DEVIS", font=Font(bold=True, size=22, color=NAVY), align="right")
+    ws.merge_cells(f"D{r}:E{r}")
+    r += 1
+
+    gauche = []
+    for champ in [entreprise.get("forme_juridique"), entreprise.get("adresse"),
+                  f"SIRET : {entreprise.get('siret')}" if entreprise.get("siret") else None,
+                  f"TVA : {entreprise.get('tva_intra')}" if entreprise.get("tva_intra") else None]:
+        if champ:
+            gauche.extend(str(champ).split("\n"))
+    droite = [x for x in [
+        f"N° {infos.get('numero', '')}",
+        f"Date d'émission : {infos.get('date', '')}",
+        (f"Valable jusqu'au : {infos.get('validite')}" if infos.get("validite")
+         else (f"Validité : {infos.get('validite_jours')} jours" if infos.get("validite_jours") else None)),
+    ] if x]
+    for i in range(max(len(gauche), len(droite))):
+        if i < len(gauche):
+            sc(f"A{r}", gauche[i], font=Font(size=9, color="404040"))
+        if i < len(droite):
+            sc(f"D{r}", droite[i], font=Font(size=9, color="404040"), align="right")
+            ws.merge_cells(f"D{r}:E{r}")
+        r += 1
+
+    r += 1
+    deb = r
+    sc(f"A{r}", "DESTINATAIRE", font=Font(bold=True, italic=True, size=10, color=NAVY))
+    r += 1
+    sc(f"A{r}", infos.get("client") or "", font=Font(bold=True, size=10))
+    r += 1
+    if infos.get("client_adresse"):
+        sc(f"A{r}", infos.get("client_adresse"), font=Font(size=9), wrap=True)
+        r += 1
+    sc(f"A{r}", f"Tél : {infos.get('client_tel') or ''}", font=Font(size=9))
+    r += 1
+    for rr in range(deb, r):
+        for col in "ABCDE":
+            ws[f"{col}{rr}"].fill = PatternFill("solid", fgColor=BOX_FILL)
+            ws[f"{col}{rr}"].border = border
+
+    r += 1
+    if infos.get("objet"):
+        sc(f"A{r}", "Objet :", font=Font(bold=True, size=10))
+        sc(f"B{r}", infos.get("objet"), font=Font(size=10))
+        ws.merge_cells(f"B{r}:E{r}")
+        r += 2
+    else:
+        r += 1
+
+    for j, titre in enumerate(["Désignation", "Qté", "Unité", "PU HT (€)", "Total HT (€)"]):
+        sc(f"{get_column_letter(j + 1)}{r}", titre,
+           font=Font(bold=True, size=10, color="FFFFFF"), fill=HEADER_FILL,
+           align="center" if j else "left", border_=border)
+    r += 1
+
+    for lg in lignes:
+        sc(f"A{r}", lg.get("designation") or "", font=Font(size=9), border_=border, wrap=True)
+        sc(f"B{r}", lg.get("quantite") or 0, font=Font(size=9), align="center", border_=border)
+        sc(f"C{r}", lg.get("unite") or "", font=Font(size=9), align="center", border_=border)
+        d = sc(f"D{r}", lg.get("prix_unitaire") or 0, font=Font(size=9), align="right", border_=border)
+        e = sc(f"E{r}", lg.get("montant_ht") or 0, font=Font(size=9), align="right", border_=border)
+        d.number_format = '#,##0.00'
+        e.number_format = '#,##0.00'
+        r += 1
+
+    r += 1
+
+    def total(label, valeur, *, bold=False, size=10, fill=None):
+        nonlocal r
+        sc(f"D{r}", label, font=Font(bold=bold, size=size), align="right")
+        c = sc(f"E{r}", valeur, align="right", fill=fill, border_=border,
+               font=Font(bold=bold, size=size, color="FFFFFF" if fill else "000000"))
+        c.number_format = '#,##0.00 "€"'
+        r += 1
+
+    total("Sous-total HT", totaux.get("sous_total_ht", 0))
+    if totaux.get("marge_pct"):
+        total(f"Marge ({totaux['marge_pct']:g} %)",
+              totaux.get("total_ht", 0) - totaux.get("sous_total_ht", 0))
+    total("Total HT", totaux.get("total_ht", 0), bold=True)
+    total(f"TVA ({totaux.get('tva_pct', 0):g} %)", totaux.get("montant_tva", 0))
+    total("TOTAL TTC", totaux.get("total_ttc", 0), bold=True, size=12, fill=HEADER_FILL)
+
+    ws.print_area = f"A1:E{r}"
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.page_margins.top = ws.page_margins.bottom = 0.5
+    ws.sheet_view.showGridLines = False
+
+    buf = BytesIO()
+    wb.save(buf)
     return buf.getvalue()
 
 
