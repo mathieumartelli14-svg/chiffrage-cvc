@@ -27,6 +27,12 @@ CLIENT_COLS = ["nom", "adresse", "telephone", "email", "siret"]
 DEVIS_COLS = ["numero", "date_devis", "client_nom", "client_adresse", "date_debut",
               "duree", "marge_pct", "tva_pct", "lignes_json", "statut"]
 STATUTS = ["En attente", "Accepté", "Refusé"]
+TVA_AUTORISEES = [0.0, 5.5, 10.0, 20.0]
+# Table annexe (remise, mentions, date de modif) : la table `devis` reste inchangée.
+COMPLEMENT_COLS = ["numero", "remise_type", "remise_valeur", "mentions", "date_modif"]
+# Colonnes de l'éditeur de lignes (les 3 dernières sont conservées mais masquées)
+COLS_EDITION = ["ordre", "groupe", "designation", "unite", "quantite", "prix_unitaire",
+                "prix_fourniture", "mo_unit", "mo_active"]
 ENTREPRISE_CHAMPS = [
     "raison_sociale", "forme_juridique", "adresse", "siret", "tva_intra",
     "assurance_nom", "assurance_police", "assurance_couverture",
@@ -62,6 +68,9 @@ def init_db():
             numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
             date_debut TEXT, duree TEXT, marge_pct DOUBLE PRECISION,
             tva_pct DOUBLE PRECISION, lignes_json TEXT, statut TEXT)"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS devis_complements (
+            numero TEXT PRIMARY KEY, remise_type TEXT, remise_valeur DOUBLE PRECISION,
+            mentions TEXT, date_modif TEXT)"""))
     init_utilisateurs()
 
 
@@ -137,6 +146,50 @@ def maj_statuts(numero_to_statut: dict):
     df = charger_devis()
     df["statut"] = df["numero"].map(numero_to_statut).fillna(df["statut"])
     _ecrire("devis", df)
+
+
+def mettre_a_jour_devis(numero: str, champs: dict) -> bool:
+    """Réécrit les champs d'un devis existant (même numéro). Même mécanique que maj_statuts."""
+    df = charger_devis()
+    masque = df["numero"] == numero
+    if not masque.any():
+        return False
+    for col, val in champs.items():
+        if col in DEVIS_COLS and col != "numero":
+            df.loc[masque, col] = val
+    _ecrire("devis", df)
+    return True
+
+
+def charger_complements():
+    return _lire("devis_complements", COMPLEMENT_COLS)
+
+
+def complement_devis(numero: str) -> dict:
+    """Remise / mentions / date de modif d'un devis (valeurs neutres si absent)."""
+    res = {"remise_type": "%", "remise_valeur": 0.0, "mentions": "", "date_modif": ""}
+    df = charger_complements()
+    sel = df[df["numero"] == numero]
+    if not sel.empty:
+        r = sel.iloc[0]
+        res["remise_type"] = "€" if r.get("remise_type") == "€" else "%"
+        res["remise_valeur"] = _num(r.get("remise_valeur"))
+        res["mentions"] = _texte(r.get("mentions"))
+        res["date_modif"] = _texte(r.get("date_modif"))
+    return res
+
+
+def enregistrer_complement(numero: str, remise_type: str, remise_valeur: float, mentions: str):
+    """Upsert de la ligne annexe + horodatage de la modification."""
+    with get_engine().begin() as con:
+        con.execute(text("""INSERT INTO devis_complements
+            (numero, remise_type, remise_valeur, mentions, date_modif)
+            VALUES (:n, :t, :v, :m, :d)
+            ON CONFLICT (numero) DO UPDATE SET
+              remise_type = EXCLUDED.remise_type, remise_valeur = EXCLUDED.remise_valeur,
+              mentions = EXCLUDED.mentions, date_modif = EXCLUDED.date_modif"""),
+            {"n": numero, "t": remise_type, "v": float(remise_valeur), "m": mentions,
+             "d": datetime.now().strftime("%Y-%m-%d %H:%M")})
 
 
 def prochain_numero() -> str:
@@ -284,7 +337,9 @@ def generer_excel_devis(entreprise, infos, lignes, totaux) -> bytes:
     total("Sous-total HT", totaux.get("sous_total_ht", 0))
     if totaux.get("marge_pct"):
         total(f"Marge ({totaux['marge_pct']:g} %)",
-              totaux.get("total_ht", 0) - totaux.get("sous_total_ht", 0))
+              totaux.get("total_ht_brut", totaux.get("total_ht", 0)) - totaux.get("sous_total_ht", 0))
+    if totaux.get("remise_montant"):
+        total("Remise", -totaux["remise_montant"])
     total("Total HT", totaux.get("total_ht", 0), bold=True)
     total(f"TVA ({totaux.get('tva_pct', 0):g} %)", totaux.get("montant_tva", 0))
     total("TOTAL TTC", totaux.get("total_ttc", 0), bold=True, size=12, fill=HEADER_FILL)
@@ -315,14 +370,59 @@ def prix_unitaire(ligne, taux_global):
     return (ligne.get("prix_fourniture") or 0) + prix_mo(ligne.get("temps_mo"), ligne.get("nb_poseurs"), taux)
 
 
+def _vide(x) -> bool:
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return True
+    try:
+        return bool(pd.isna(x))
+    except (TypeError, ValueError):
+        return False
+
+
+def _num(x, defaut=0.0) -> float:
+    """Nombre propre : None / NaN / texte invalide -> défaut."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return defaut
+    return defaut if v != v else v
+
+
+def _texte(x) -> str:
+    return "" if _vide(x) else str(x).strip()
+
+
+def montant_ligne(ligne) -> float:
+    """Total HT d'une ligne, toujours recalculé (qté × PU). Repli sur montant_ht
+    uniquement pour d'anciennes lignes sans PU."""
+    if _vide(ligne.get("prix_unitaire")):
+        return _num(ligne.get("montant_ht"))
+    return _num(ligne.get("quantite")) * _num(ligne.get("prix_unitaire"))
+
+
+def calculer_totaux(lignes, marge_pct=0, tva_pct=0, remise_type="%", remise_valeur=0) -> dict:
+    """Sous-total -> marge -> remise globale (% ou €) -> total HT -> TVA -> TTC.
+    Clés compatibles avec generer_pdf_devis."""
+    marge, tva, rv = _num(marge_pct), _num(tva_pct), max(_num(remise_valeur), 0.0)
+    remise_type = "€" if remise_type == "€" else "%"
+    sous = sum(montant_ligne(l) for l in lignes)
+    brut = sous * (1 + marge / 100)
+    remise = min(rv, brut) if remise_type == "€" else brut * min(rv, 100.0) / 100
+    total_ht = brut - remise
+    montant_tva = total_ht * tva / 100
+    return {"sous_total_ht": sous, "marge_pct": marge, "total_ht_brut": brut,
+            "remise_type": remise_type, "remise_valeur": rv, "remise_montant": remise,
+            "total_ht": total_ht, "tva_pct": tva, "montant_tva": montant_tva,
+            "total_ttc": total_ht + montant_tva}
+
+
 def total_devis_ttc(rec) -> float:
     try:
         lignes = json.loads(rec["lignes_json"]) if rec.get("lignes_json") else []
     except Exception:
         lignes = []
-    sous = sum((l.get("montant_ht") or 0) for l in lignes)
-    total_ht = sous * (1 + (rec.get("marge_pct") or 0) / 100)
-    return total_ht * (1 + (rec.get("tva_pct") or 0) / 100)
+    return calculer_totaux(lignes, rec.get("marge_pct"), rec.get("tva_pct"),
+                           rec.get("remise_type"), rec.get("remise_valeur"))["total_ttc"]
 
 
 # ----------------------------------------------------------------------------
@@ -425,7 +525,13 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     pdf.cell(40, 7, euro(totaux["sous_total_ht"]), align="R", ln=True)
     if totaux.get("marge_pct"):
         pdf.cell(140, 7, _txt(f"Marge ({totaux['marge_pct']:g} %)"), align="R")
-        pdf.cell(40, 7, euro(totaux["total_ht"] - totaux["sous_total_ht"]), align="R", ln=True)
+        pdf.cell(40, 7, euro(totaux.get("total_ht_brut", totaux["total_ht"]) - totaux["sous_total_ht"]),
+                 align="R", ln=True)
+    if totaux.get("remise_montant"):
+        lib = ("Remise" if totaux.get("remise_type") == "€"
+               else f"Remise ({totaux.get('remise_valeur', 0):g} %)")
+        pdf.cell(140, 7, _txt(lib), align="R")
+        pdf.cell(40, 7, "- " + euro(totaux["remise_montant"]), align="R", ln=True)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(140, 7, "Total HT", align="R")
     pdf.cell(40, 7, euro(totaux["total_ht"]), align="R", ln=True)
@@ -436,6 +542,12 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux):
     pdf.cell(140, 8, "TOTAL TTC", align="R")
     pdf.cell(40, 8, euro(totaux["total_ttc"]), align="R", ln=True)
 
+    if infos.get("mentions"):
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(0, 5, "Mentions", ln=True)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(0, 5, _txt(infos["mentions"]))
     if entreprise.get("conditions_reglement"):
         pdf.ln(3)
         pdf.set_font("Helvetica", "B", 9)
@@ -663,6 +775,273 @@ def panneau_comptes():
 
 
 # ----------------------------------------------------------------------------
+# ÉDITION D'UN DEVIS EXISTANT
+# ----------------------------------------------------------------------------
+def _df_edition(lignes) -> pd.DataFrame:
+    """Lignes JSON -> DataFrame pour l'éditeur (colonne « ordre » pour réordonner)."""
+    df = pd.DataFrame(lignes)
+    for c in COLS_EDITION:
+        if c not in df.columns:
+            df[c] = None
+    df = df[COLS_EDITION].reset_index(drop=True)
+    # Types forcés : sur un devis sans ligne, pandas typerait les colonnes texte
+    # en float et st.data_editor refuserait de les éditer.
+    df["ordre"] = pd.Series([float(i) for i in range(1, len(df) + 1)], index=df.index, dtype=float)
+    for c in ("quantite", "prix_unitaire", "prix_fourniture", "mo_unit"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    # anciennes lignes sans PU : PU = fourniture + MO
+    sans_pu = df["prix_unitaire"].isna()
+    df.loc[sans_pu, "prix_unitaire"] = (df.loc[sans_pu, "prix_fourniture"].fillna(0)
+                                        + df.loc[sans_pu, "mo_unit"].fillna(0))
+    df["mo_active"] = pd.Series([True if _vide(v) else bool(v) for v in df["mo_active"]],
+                                index=df.index, dtype=bool)
+    for c in ("groupe", "designation", "unite"):
+        df[c] = pd.Series([_texte(v) for v in df[c]], index=df.index, dtype="string")
+    return df
+
+
+def _ligne_blanche(r) -> bool:
+    return all(_vide(r.get(c)) for c in ("designation", "unite", "quantite", "prix_unitaire"))
+
+
+def _ventiler_pu(pu, fourn, mo, mo_active):
+    """Garde fourniture / MO cohérents avec le PU saisi : le flux « Dupliquer »
+    recalcule PU = fourniture + MO, il doit retrouver le même prix."""
+    mo_app = mo if mo_active else 0.0
+    if abs(fourn + mo_app - pu) < 0.005:
+        return fourn, mo, mo_active
+    if pu >= mo_app:
+        return pu - mo_app, mo, mo_active
+    return pu, mo, False
+
+
+def lignes_depuis_editeur(df):
+    """Nettoie, valide et trie les lignes saisies. Retourne (lignes, erreurs)."""
+    enregs = list(enumerate(df.to_dict("records"), start=1))
+    enregs.sort(key=lambda p: (_vide(p[1].get("ordre")), _num(p[1].get("ordre")), p[0]))
+    lignes, erreurs = [], []
+    for n, r in enregs:
+        desig, unite = _texte(r.get("designation")), _texte(r.get("unite"))
+        q, pu = r.get("quantite"), r.get("prix_unitaire")
+        if _ligne_blanche(r):
+            continue  # ligne vide ajoutée puis laissée telle quelle : ignorée
+        err = []
+        if not desig:
+            err.append(f"Ligne {n} : désignation obligatoire.")
+        if _num(q) < 0:
+            err.append(f"Ligne {n} : quantité négative.")
+        if _num(pu) < 0:
+            err.append(f"Ligne {n} : prix unitaire négatif.")
+        if err:
+            erreurs.extend(err)
+            continue
+        q, pu = _num(q), _num(pu)
+        mo_active = True if _vide(r.get("mo_active")) else bool(r.get("mo_active"))
+        fourn, mo, mo_active = _ventiler_pu(pu, _num(r.get("prix_fourniture")),
+                                            _num(r.get("mo_unit")), mo_active)
+        lignes.append({"groupe": _texte(r.get("groupe")), "designation": desig, "unite": unite,
+                       "quantite": q, "prix_fourniture": fourn, "mo_unit": mo,
+                       "mo_active": bool(mo_active), "prix_unitaire": pu, "montant_ht": q * pu})
+    return lignes, erreurs
+
+
+def _figer_edition(etat, df):
+    """Remplace la source de l'éditeur et change sa clé (sinon Streamlit
+    ré-appliquerait les anciennes modifications sur la nouvelle source)."""
+    garder = [not _ligne_blanche(r) for r in df.to_dict("records")]
+    etat["df"] = df[garder].reset_index(drop=True)
+    etat["version"] += 1
+
+
+def _fermer_edition(message=None):
+    st.session_state.pop("ed_etat", None)
+    if message:
+        st.session_state["flash"] = message
+    st.rerun()  # rerun complet = fermeture du dialog
+
+
+@st.dialog("✏️ Modifier le devis", width="large")
+def dialog_modifier_devis(numero, taux_horaire):
+    etat = st.session_state.get("ed_etat")
+    if not etat or etat.get("numero") != numero:
+        tous = charger_devis()
+        sel = tous[tous["numero"] == numero]
+        if sel.empty:
+            st.error(f"Devis {numero} introuvable.")
+            return
+        rec = sel.iloc[0].to_dict()
+        illisible = False
+        try:
+            lignes_init = json.loads(rec["lignes_json"]) if not _vide(rec.get("lignes_json")) else []
+        except Exception:
+            lignes_init, illisible = [], True
+        comp = complement_devis(numero)
+        tva = _num(rec.get("tva_pct"), 20.0)
+        try:
+            d = date.fromisoformat(_texte(rec.get("date_devis")))
+        except ValueError:
+            d = date.today()
+        etat = {"numero": numero, "rec": rec, "date_modif": comp["date_modif"],
+                "jeton": pysecrets.token_hex(4), "version": 0, "df": _df_edition(lignes_init),
+                "tva_hors_liste": tva not in TVA_AUTORISEES, "lignes_illisibles": illisible}
+        st.session_state["ed_etat"] = etat
+        st.session_state.update({
+            "ed_client_nom": _texte(rec.get("client_nom")),
+            "ed_client_adresse": _texte(rec.get("client_adresse")),
+            "ed_date": d, "ed_tva": tva if tva in TVA_AUTORISEES else 20.0,
+            "ed_date_debut": _texte(rec.get("date_debut")), "ed_duree": _texte(rec.get("duree")),
+            "ed_marge": _num(rec.get("marge_pct")), "ed_remise_type": comp["remise_type"],
+            "ed_remise_valeur": comp["remise_valeur"], "ed_mentions": comp["mentions"]})
+
+    rec = etat["rec"]
+    st.caption(f"Devis **{numero}** — statut : {_texte(rec.get('statut')) or 'En attente'}"
+               + (f" — dernière modif : {etat['date_modif']}" if etat["date_modif"] else ""))
+    if etat["lignes_illisibles"]:
+        st.error("Les lignes enregistrées sont illisibles : enregistrement bloqué pour ne pas les écraser.")
+    if etat["tva_hors_liste"]:
+        st.warning(f"TVA enregistrée ({_num(rec.get('tva_pct')):g} %) hors liste autorisée : "
+                   "remplacée par 20 %, vérifie avant d'enregistrer.")
+
+    # ---- En-tête ----
+    c1, c2, c3 = st.columns([2, 1, 1])
+    client_nom = c1.text_input("Client", key="ed_client_nom")
+    date_devis = c2.date_input("Date", key="ed_date", format="DD/MM/YYYY")
+    tva_pct = c3.selectbox("TVA", TVA_AUTORISEES, key="ed_tva", format_func=lambda v: f"{v:g} %")
+    client_adresse = st.text_area("Adresse du client", key="ed_client_adresse", height=68)
+    c4, c5 = st.columns(2)
+    date_debut = c4.text_input("Début des travaux", key="ed_date_debut")
+    duree = c5.text_input("Durée estimée", key="ed_duree")
+    c6, c7, c8 = st.columns(3)
+    marge_pct = c6.number_input("Marge (%)", min_value=0.0, step=1.0, key="ed_marge")
+    remise_type = c7.radio("Remise globale en", ["%", "€"], horizontal=True, key="ed_remise_type")
+    remise_valeur = c8.number_input(f"Remise ({remise_type})", min_value=0.0, step=1.0,
+                                    key="ed_remise_valeur")
+    mentions = st.text_area("Mentions libres (imprimées sur le PDF)", key="ed_mentions", height=68)
+
+    # ---- Lignes ----
+    st.markdown("**Lignes du devis**")
+    st.caption("« + » sous le tableau = ligne vide · cocher une ligne puis 🗑️ = suppression · "
+               "pour réordonner, change « Ordre » puis « Appliquer l'ordre ».")
+    edite = st.data_editor(
+        etat["df"], num_rows="dynamic", use_container_width=True,
+        column_order=["ordre", "groupe", "designation", "unite", "quantite", "prix_unitaire"],
+        column_config={
+            "ordre": st.column_config.NumberColumn("Ordre", step=1, format="%d", width="small"),
+            "groupe": st.column_config.TextColumn("Ensemble"),
+            "designation": st.column_config.TextColumn("Désignation", width="large"),
+            "unite": st.column_config.TextColumn("Unité", width="small"),
+            "quantite": st.column_config.NumberColumn("Qté", min_value=0.0, format="%.2f"),
+            "prix_unitaire": st.column_config.NumberColumn("PU HT (€)", min_value=0.0, format="%.2f")},
+        key=f"ed_lignes_{etat['jeton']}_{etat['version']}")
+
+    if st.button("↕️ Appliquer l'ordre", key="ed_ordre"):
+        df = edite.copy()
+        df["_pos"] = range(len(df))
+        df = df.sort_values(["ordre", "_pos"], na_position="last").drop(columns="_pos")
+        df["ordre"] = [float(i) for i in range(1, len(df) + 1)]
+        _figer_edition(etat, df)
+        st.rerun(scope="fragment")
+
+    with st.expander("📚 Ajouter une ligne depuis la bibliothèque"):
+        biblio = charger_bibliotheque()
+        rech = st.text_input("🔍 Filtrer", key="ed_rech")
+        options = [i for i in biblio.index
+                   if not rech or rech.lower() in str(biblio.loc[i, "designation"]).lower()
+                   or rech.lower() in str(biblio.loc[i, "code"]).lower()]
+        if not options:
+            st.caption("Aucun ouvrage." if biblio.empty else "Aucun ouvrage ne correspond.")
+        else:
+            b1, b2, b3 = st.columns([3, 1, 1])
+            choix = b1.selectbox("Ouvrage", options, key="ed_biblio_choix",
+                                 format_func=lambda i: f"{biblio.loc[i, 'designation']} ({biblio.loc[i, 'unite']})")
+            qte = b2.number_input("Quantité", min_value=0.0, value=1.0, step=1.0, key="ed_biblio_qte")
+            if b3.button("➕ Ajouter", key="ed_biblio_ajout", use_container_width=True):
+                o = biblio.loc[choix].to_dict()
+                fourn = _num(o.get("prix_fourniture"))
+                mo = prix_mo(_num(o.get("temps_mo")), _num(o.get("nb_poseurs")),
+                             _num(o.get("taux_horaire")) or taux_horaire)
+                nouvelle = {"ordre": _num(edite["ordre"].max()) + 1, "groupe": "",
+                            "designation": _texte(o.get("designation")), "unite": _texte(o.get("unite")),
+                            "quantite": qte, "prix_unitaire": fourn + mo, "prix_fourniture": fourn,
+                            "mo_unit": mo, "mo_active": True}
+                _figer_edition(etat, pd.concat([edite, pd.DataFrame([nouvelle])], ignore_index=True))
+                st.rerun(scope="fragment")
+
+    # ---- Validation + recalcul en direct ----
+    lignes, erreurs = lignes_depuis_editeur(edite)
+    totaux = calculer_totaux(lignes, marge_pct, tva_pct, remise_type, remise_valeur)
+    if remise_type == "%" and remise_valeur > 100:
+        erreurs.append("Remise : 100 % maximum.")
+    if remise_type == "€" and remise_valeur > totaux["total_ht_brut"] + 1e-9:
+        erreurs.append("Remise supérieure au total HT.")
+    for e in erreurs:
+        st.warning(e)
+
+    if lignes:
+        with st.expander("Total HT par ligne (recalculé)", expanded=True):
+            st.dataframe(pd.DataFrame([{"Désignation": l["designation"], "Qté": l["quantite"],
+                                        "Unité": l["unite"], "PU HT (€)": l["prix_unitaire"],
+                                        "Total HT (€)": l["montant_ht"]} for l in lignes]),
+                         hide_index=True, use_container_width=True,
+                         column_config={"PU HT (€)": st.column_config.NumberColumn(format="%.2f"),
+                                        "Total HT (€)": st.column_config.NumberColumn(format="%.2f")})
+    else:
+        st.info("Aucune ligne : le devis (et son PDF) sera à 0 €.")
+
+    def eur(x):
+        return f"{x:,.2f} €".replace(",", " ")
+
+    m = st.columns(3) + st.columns(3)  # 2 rangées : lisible même en fenêtre étroite
+    m[0].metric("Sous-total HT", eur(totaux["sous_total_ht"]))
+    m[1].metric(f"Marge {totaux['marge_pct']:g} %",
+                eur(totaux["total_ht_brut"] - totaux["sous_total_ht"]))
+    m[2].metric("Remise", eur(-totaux["remise_montant"]) if totaux["remise_montant"] else "—")
+    m[3].metric("Total HT", eur(totaux["total_ht"]))
+    m[4].metric(f"TVA {tva_pct:g} %", eur(totaux["montant_tva"]))
+    m[5].metric("Total TTC", eur(totaux["total_ttc"]))
+
+    # ---- Actions ----
+    bloque = bool(erreurs) or etat["lignes_illisibles"]
+    ent = charger_entreprise()
+    vj = str(ent.get("validite_jours") or "").strip()
+    infos = {"numero": numero, "client": client_nom, "client_adresse": client_adresse,
+             "client_tel": "", "date": date_devis.strftime("%d/%m/%Y"),
+             "validite": (date_devis + timedelta(days=int(vj))).strftime("%d/%m/%Y") if vj.isdigit() else None,
+             "validite_jours": ent.get("validite_jours"), "date_debut": date_debut,
+             "duree": duree, "mentions": mentions.strip()}
+    champs = {"date_devis": str(date_devis), "client_nom": client_nom.strip(),
+              "client_adresse": client_adresse, "date_debut": date_debut, "duree": duree,
+              "marge_pct": float(marge_pct), "tva_pct": float(tva_pct),
+              "lignes_json": json.dumps(lignes, ensure_ascii=False)}
+
+    a1, a2, a3, a4 = st.columns(4)
+    if a1.button("💾 Enregistrer", type="primary", disabled=bloque, use_container_width=True):
+        if mettre_a_jour_devis(numero, champs):
+            enregistrer_complement(numero, remise_type, remise_valeur, mentions.strip())
+            _fermer_edition(f"Devis {numero} mis à jour.")
+        else:
+            st.error("Ce devis n'existe plus en base.")
+    if a2.button("🆕 Enregistrer comme nouveau", disabled=bloque, use_container_width=True):
+        nouveau = prochain_numero()
+        if sauvegarder_devis({"numero": nouveau, **champs, "statut": "En attente"}):
+            enregistrer_complement(nouveau, remise_type, remise_valeur, mentions.strip())
+            st.session_state.numero_courant = prochain_numero()  # évite un doublon côté « Nouveau devis »
+            _fermer_edition(f"Nouveau devis {nouveau} créé à partir de {numero}.")
+        else:
+            st.error("Numéro déjà pris, réessaie.")
+    pdf_bytes = b""
+    if not bloque:
+        try:
+            pdf_bytes = generer_pdf_devis(ent, infos, lignes, totaux)
+        except Exception as exc:
+            st.error(f"Génération PDF impossible : {exc}")
+    a3.download_button("📄 Régénérer le PDF", pdf_bytes, f"{numero}.pdf", "application/pdf",
+                       disabled=bloque or not pdf_bytes, use_container_width=True, key="ed_pdf")
+    if a4.button("✖️ Annuler", use_container_width=True):
+        _fermer_edition()
+
+
+# ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
 def main():
@@ -676,6 +1055,9 @@ def main():
         st.session_state.numero_courant = prochain_numero()
 
     st.title("Module chiffrage CVC")
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.toast(flash, icon="✅")
 
     with st.sidebar:
         panneau_comptes()
@@ -1006,12 +1388,14 @@ def main():
         if saved.empty:
             st.info("Aucun devis enregistré pour l'instant.")
         else:
+            saved = saved.merge(charger_complements(), on="numero", how="left")
             vue = pd.DataFrame({
                 "numero": saved["numero"],
                 "date_devis": saved["date_devis"],
                 "client_nom": saved["client_nom"],
                 "total_ttc": saved.apply(total_devis_ttc, axis=1).round(2),
                 "statut": saved["statut"],
+                "date_modif": [_texte(v) for v in saved["date_modif"]],
             })
             edited_s = st.data_editor(
                 vue, use_container_width=True, hide_index=True,
@@ -1020,7 +1404,8 @@ def main():
                     "date_devis": st.column_config.TextColumn("Date", disabled=True),
                     "client_nom": st.column_config.TextColumn("Client", disabled=True),
                     "total_ttc": st.column_config.NumberColumn("Total TTC (€)", format="%.2f", disabled=True),
-                    "statut": st.column_config.SelectboxColumn("Statut", options=STATUTS)},
+                    "statut": st.column_config.SelectboxColumn("Statut", options=STATUTS),
+                    "date_modif": st.column_config.TextColumn("Modifié le", disabled=True)},
                 key="editeur_suivi")
             c1, c2 = st.columns(2)
             if c1.button("💾 Enregistrer les statuts"):
@@ -1032,7 +1417,7 @@ def main():
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             st.divider()
-            st.markdown("**Re-télécharger un devis en PDF**")
+            st.markdown("**Modifier ou re-télécharger un devis**")
             libelles_s = {r["numero"]: f"{r['numero']} — {r['client_nom'] or ''} — {r['date_devis']}"
                           for _, r in saved.iterrows()}
             sel_pdf = st.selectbox("Devis", saved["numero"].tolist(),
@@ -1042,20 +1427,20 @@ def main():
                 lignes_rec = json.loads(rec["lignes_json"]) if rec["lignes_json"] else []
             except Exception:
                 lignes_rec = []
-            sous_rec = sum((l.get("montant_ht") or 0) for l in lignes_rec)
-            total_ht_rec = sous_rec * (1 + (rec.get("marge_pct") or 0) / 100)
-            tva_rec = rec.get("tva_pct") or 0
-            totaux_rec = {"sous_total_ht": sous_rec, "marge_pct": rec.get("marge_pct") or 0,
-                          "total_ht": total_ht_rec, "tva_pct": tva_rec,
-                          "montant_tva": total_ht_rec * tva_rec / 100,
-                          "total_ttc": total_ht_rec * (1 + tva_rec / 100)}
+            totaux_rec = calculer_totaux(lignes_rec, rec.get("marge_pct"), rec.get("tva_pct"),
+                                         rec.get("remise_type"), rec.get("remise_valeur"))
             infos_rec = {"numero": rec["numero"], "client": rec["client_nom"],
                          "client_adresse": rec["client_adresse"], "date": rec["date_devis"],
                          "validite_jours": charger_entreprise().get("validite_jours"),
-                         "date_debut": rec["date_debut"], "duree": rec["duree"]}
+                         "date_debut": rec["date_debut"], "duree": rec["duree"],
+                         "mentions": _texte(rec.get("mentions"))}
             pdf_rec = generer_pdf_devis(charger_entreprise(), infos_rec, lignes_rec, totaux_rec)
-            st.download_button("📄 Télécharger ce devis (PDF)", pdf_rec, f"{sel_pdf}.pdf",
+            cP, cM = st.columns(2)
+            cP.download_button("📄 Télécharger ce devis (PDF)", pdf_rec, f"{sel_pdf}.pdf",
                                "application/pdf", key="suivi_pdf_dl")
+            if cM.button("✏️ Modifier ce devis", key="suivi_modifier"):
+                st.session_state.pop("ed_etat", None)  # repart toujours de la version en base
+                dialog_modifier_devis(sel_pdf, taux_horaire)
 
             st.caption(
                 f"En attente : {(saved['statut']=='En attente').sum()}  |  "
