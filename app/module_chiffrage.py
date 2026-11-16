@@ -29,7 +29,8 @@ DEVIS_COLS = ["numero", "date_devis", "client_nom", "client_adresse", "date_debu
 STATUTS = ["En attente", "Accepté", "Refusé"]
 TVA_AUTORISEES = [0.0, 5.5, 10.0, 20.0]
 # Table annexe (remise, mentions, date de modif) : la table `devis` reste inchangée.
-COMPLEMENT_COLS = ["numero", "remise_type", "remise_valeur", "mentions", "date_modif"]
+COMPLEMENT_COLS = ["numero", "remise_type", "remise_valeur", "mentions", "date_modif",
+                   "mise_en_forme", "options_variantes"]
 # Colonnes de l'éditeur de lignes (les 3 dernières sont conservées mais masquées)
 COLS_EDITION = ["ordre", "groupe", "designation", "unite", "quantite", "prix_unitaire",
                 "prix_fourniture", "mo_unit", "mo_active"]
@@ -37,6 +38,11 @@ ENTREPRISE_CHAMPS = [
     "raison_sociale", "forme_juridique", "adresse", "siret", "tva_intra",
     "assurance_nom", "assurance_police", "assurance_couverture",
     "conditions_reglement", "validite_jours",
+    # en-tête PDF (tous facultatifs)
+    "capital", "telephone", "email", "site_web", "code_ape",
+    "rc_pro_nom", "rc_pro_police", "qualifications",
+    # mentions du devis (la mise en forme vit sous la clé « mise_en_forme »)
+    "acompte_pct", "mention_devis",
 ]
 
 
@@ -71,7 +77,20 @@ def init_db():
         con.execute(text("""CREATE TABLE IF NOT EXISTS devis_complements (
             numero TEXT PRIMARY KEY, remise_type TEXT, remise_valeur DOUBLE PRECISION,
             mentions TEXT, date_modif TEXT)"""))
+    # migration douce : colonnes ajoutées après coup (jamais supprimées)
+    _ajouter_colonnes("devis_complements", {"mise_en_forme": "TEXT", "options_variantes": "TEXT"})
     init_utilisateurs()
+
+
+def _ajouter_colonnes(table, colonnes: dict):
+    """Ajoute les colonnes manquantes (Postgres comme SQLite)."""
+    from sqlalchemy import inspect
+    eng = get_engine()
+    existantes = {c["name"] for c in inspect(eng).get_columns(table)}
+    with eng.begin() as con:
+        for nom, type_sql in colonnes.items():
+            if nom not in existantes:
+                con.execute(text(f"ALTER TABLE {table} ADD COLUMN {nom} {type_sql}"))
 
 
 def _lire(table, cols):
@@ -167,7 +186,8 @@ def charger_complements():
 
 def complement_devis(numero: str) -> dict:
     """Remise / mentions / date de modif d'un devis (valeurs neutres si absent)."""
-    res = {"remise_type": "%", "remise_valeur": 0.0, "mentions": "", "date_modif": ""}
+    res = {"remise_type": "%", "remise_valeur": 0.0, "mentions": "", "date_modif": "",
+           "mise_en_forme": None, "options_variantes": ""}
     df = charger_complements()
     sel = df[df["numero"] == numero]
     if not sel.empty:
@@ -176,7 +196,32 @@ def complement_devis(numero: str) -> dict:
         res["remise_valeur"] = _num(r.get("remise_valeur"))
         res["mentions"] = _texte(r.get("mentions"))
         res["date_modif"] = _texte(r.get("date_modif"))
+        res["mise_en_forme"] = surcharge_mise_en_forme(r.get("mise_en_forme"))
+        res["options_variantes"] = _texte(r.get("options_variantes"))
     return res
+
+
+def surcharge_mise_en_forme(valeur):
+    """JSON stocké avec le devis -> dict, ou None (= préférences de l'entreprise)."""
+    if _vide(valeur):
+        return None
+    try:
+        d = json.loads(valeur) if isinstance(valeur, str) else valeur
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) and d else None
+
+
+def enregistrer_mise_en_forme(numero: str, surcharge, options: str):
+    """Mise en forme propre à un devis (None = suit l'entreprise) + options non chiffrées."""
+    with get_engine().begin() as con:
+        con.execute(text("""INSERT INTO devis_complements (numero, mise_en_forme, options_variantes)
+            VALUES (:n, :f, :o)
+            ON CONFLICT (numero) DO UPDATE SET
+              mise_en_forme = EXCLUDED.mise_en_forme,
+              options_variantes = EXCLUDED.options_variantes"""),
+            {"n": numero, "f": json.dumps(surcharge, ensure_ascii=False) if surcharge else None,
+             "o": (options or "").strip() or None})
 
 
 def enregistrer_complement(numero: str, remise_type: str, remise_valeur: float, mentions: str):
@@ -202,8 +247,11 @@ def prochain_numero() -> str:
 
 
 def charger_entreprise():
+    # Valeurs par défaut = migration douce : un ancien entreprise.json sans
+    # les nouveaux champs reste valide, ils prennent simplement ces valeurs.
     base = {c: "" for c in ENTREPRISE_CHAMPS}
     base["validite_jours"] = "30"
+    base["mention_devis"] = MENTION_DEVIS_DEFAUT
     if ENTREPRISE_PATH.exists():
         try:
             base.update(json.loads(ENTREPRISE_PATH.read_text(encoding="utf-8")))
@@ -428,6 +476,129 @@ def total_devis_ttc(rec) -> float:
 # ----------------------------------------------------------------------------
 # PDF
 # ----------------------------------------------------------------------------
+# --- Mise en forme du devis PDF ----------------------------------------------
+# Paramètres choisis par l'utilisateur. Ils vivent à deux niveaux :
+#   - entreprise.json["mise_en_forme"]        : préférences par défaut ;
+#   - devis_complements.mise_en_forme (JSON)  : surcharge d'UN devis (ou NULL).
+# Effectif = MISE_EN_FORME_DEFAUT < préférences entreprise < surcharge devis.
+COULEUR_ACCENT_DEFAUT = "#1F3864"
+MENTION_DEVIS_DEFAUT = "Devis gratuit, établi avant tout commencement des travaux."
+MENTION_ACCORD = "« Devis reçu avant l'exécution des travaux, bon pour accord »"
+
+MODELES = {"classique": "Classique épuré", "moderne": "Moderne coloré", "compact": "Compact"}
+DESCRIPTION_MODELES = {
+    "classique": "Sobre, noir et gris, sans aplat de couleur : l'accent ne sert qu'aux filets.",
+    "moderne": "Bandeau, cartouche, titres de colonnes et total TTC sur fond d'accent, lignes zébrées.",
+    "compact": "Police et interlignes réduits, logo plus petit : idéal pour les devis à nombreuses lignes.",
+}
+PALETTE_ACCENT = {"Bleu marine": "#1F3864", "Bleu": "#2E75B6", "Vert": "#2E7D32",
+                  "Rouge brique": "#B03A2E", "Orange": "#C4501E", "Anthracite": "#3C3C3C"}
+POSITIONS_LOGO = {"gauche": "Gauche", "centre": "Centre", "droite": "Droite"}
+DEVISES = ["EUR", "CHF"]   # en toutes lettres : la police PDF intégrée n'a pas le signe €
+SECTIONS_DEVIS = {
+    "section_validite": "Durée de validité (cartouche)",
+    "section_accord": "Zone « Bon pour accord » et signature",
+    "section_options": "Options / variantes non chiffrées",
+    "section_paiement": "Conditions de paiement et acompte",
+    "section_mentions": "Mentions légales BTP détaillées",
+}
+MISE_EN_FORME_DEFAUT = {
+    "modele": "classique", "couleur_accent": COULEUR_ACCENT_DEFAUT,
+    "logo_afficher": True, "logo_position": "gauche",
+    "section_validite": True, "section_accord": True, "section_options": False,
+    "section_paiement": True, "section_mentions": True,
+    "tva_defaut": 10.0, "devise": "EUR",
+}
+
+# Un seul moteur : un modèle n'est qu'un jeu de réglages lu par les fonctions de rendu.
+_STYLE_BASE = {"bandeau": False, "fond_cartouche": False, "fond_entete": False,
+               "fond_section": False, "fond_ttc": False, "cadre_client_accent": False,
+               "zebre": None, "echelle": 1.0, "interligne": 4.4, "marge_ligne": 3.0,
+               "logo": (55.0, 24.0)}
+STYLES = {
+    "classique": dict(_STYLE_BASE),
+    "moderne": dict(_STYLE_BASE, bandeau=True, fond_cartouche=True, fond_entete=True,
+                    fond_section=True, fond_ttc=True, cadre_client_accent=True,
+                    zebre=(245, 246, 248)),
+    "compact": dict(_STYLE_BASE, zebre=(247, 247, 247), echelle=0.88, interligne=3.6,
+                    marge_ligne=1.6, logo=(40.0, 16.0)),
+}
+
+GRIS_TEXTE = (95, 95, 95)
+GRIS_FILET = (200, 200, 200)
+GRIS_LEGER = (228, 228, 228)
+LARGEUR_UTILE = 180.0                     # A4 avec marges de 15 mm
+COL_GAUCHE, COL_DROITE = 95.0, 80.0       # en-tête : entreprise | cartouche + client
+COLONNES_PDF = (("Désignation", 88, "L"), ("Unité", 14, "C"), ("Qté", 18, "R"),
+            ("P.U. HT", 28, "R"), ("Montant HT", 32, "R"))
+H_ACCORD, H_LIGNE_TOTAL = 34.0, 5.5       # cadre signature, ligne du bloc totaux
+
+
+def _hexa(valeur, defaut=COULEUR_ACCENT_DEFAUT) -> str:
+    """Couleur « #RRGGBB » valide (sinon la couleur par défaut)."""
+    h = _texte(valeur).lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        int(h, 16)
+    except ValueError:
+        return defaut
+    return f"#{h.upper()}" if len(h) == 6 else defaut
+
+
+def _rgb(valeur):
+    h = _hexa(valeur).lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _teinte(rgb, force):
+    """Éclaircit une couleur vers le blanc (force 0 = couleur, 1 = blanc)."""
+    return tuple(round(c + (255 - c) * force) for c in rgb)
+
+
+def normaliser_mise_en_forme(*couches) -> dict:
+    """Fusionne les couches (dict ou JSON, None ignoré) sur les défauts et
+    valide chaque valeur : un fichier ancien ou abîmé ne fait jamais planter."""
+    mef = dict(MISE_EN_FORME_DEFAUT)
+    for couche in couches:
+        if isinstance(couche, str):
+            try:
+                couche = json.loads(couche)
+            except ValueError:
+                couche = None
+        if isinstance(couche, dict):
+            mef.update({k: v for k, v in couche.items()
+                        if k in MISE_EN_FORME_DEFAUT and not _vide(v)})
+    d = MISE_EN_FORME_DEFAUT
+    if mef["modele"] not in MODELES:
+        mef["modele"] = d["modele"]
+    if mef["logo_position"] not in POSITIONS_LOGO:
+        mef["logo_position"] = d["logo_position"]
+    if mef["devise"] not in DEVISES:
+        mef["devise"] = d["devise"]
+    mef["couleur_accent"] = _hexa(mef["couleur_accent"])
+    tva = _num(mef["tva_defaut"], d["tva_defaut"])
+    mef["tva_defaut"] = tva if tva in TVA_AUTORISEES else d["tva_defaut"]
+    for k in ["logo_afficher", *SECTIONS_DEVIS]:
+        v = mef[k]
+        mef[k] = v.strip().lower() in ("1", "true", "oui") if isinstance(v, str) else bool(v)
+    return mef
+
+
+def mise_en_forme_entreprise(ent) -> dict:
+    """Préférences de l'entreprise (reprend l'ancienne clé « couleur_accent » à plat)."""
+    ancienne = {"couleur_accent": ent.get("couleur_accent")} if ent.get("couleur_accent") else None
+    return normaliser_mise_en_forme(ancienne, ent.get("mise_en_forme"))
+
+
+def _qte(x) -> str:
+    return f"{_num(x):g}".replace(".", ",")
+
+
+def _joindre(*morceaux, sep="  ·  ") -> str:
+    return sep.join(m for m in morceaux if m)
+
+
 def _txt(s):
     s = str(s)
     for a, b in {"€": "EUR", "œ": "oe", "Œ": "OE", "’": "'", "–": "-",
@@ -436,138 +607,518 @@ def _txt(s):
     return s.encode("latin-1", "replace").decode("latin-1")
 
 
-def _ligne_tableau(pdf, designation, unite, qte, pu, montant, euro):
-    pdf.cell(70, 7, _txt(str(designation)[:42]), border=1)
-    pdf.cell(15, 7, _txt(unite), border=1, align="C")
-    pdf.cell(20, 7, f"{qte:g}", border=1, align="C")
-    pdf.cell(35, 7, euro(pu), border=1, align="R")
-    pdf.cell(40, 7, euro(montant), border=1, align="R")
-    pdf.ln()
+def _tronquer(pdf, texte, largeur) -> str:
+    if pdf.get_string_width(texte) <= largeur:
+        return texte
+    while texte and pdf.get_string_width(texte + "...") > largeur:
+        texte = texte[:-1]
+    return texte + "..."
 
 
-def generer_pdf_devis(entreprise, infos, lignes, totaux):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
+def _validite(infos, ent) -> str:
+    jours = infos.get("validite_jours") or ent.get("validite_jours") or ""
+    jours = f"{jours} jours" if jours.isdigit() else jours
+    jusqu = infos.get("validite") or ""
+    if jours and jusqu:
+        return f"{jours} (jusqu'au {jusqu})"
+    return jours or (f"jusqu'au {jusqu}" if jusqu else "")
 
-    def euro(x):
-        return f"{x:,.2f} EUR".replace(",", " ")
 
-    if LOGO_PATH.exists():
+def _taille_logo(l_max, h_max):
+    """(largeur, hauteur) du logo ramené dans sa boîte, ratio conservé ; None si absent."""
+    if not LOGO_PATH.exists():
+        return None
+    try:
+        from PIL import Image
+        with Image.open(LOGO_PATH) as im:
+            lw, lh = im.size
+        k = min(l_max / lw, h_max / lh)
+        return lw * k, lh * k
+    except Exception:
+        return None  # logo illisible : en-tête sans logo plutôt qu'un crash
+
+
+class _PDFDevis(FPDF):
+    """FPDF + réglages de mise en forme ; en-tête allégé (pages 2 et suivantes),
+    bandeau éventuel et pied répétés automatiquement à chaque saut de page."""
+
+    def __init__(self, ent, infos, mef):
+        super().__init__(format="A4")
+        self.ent, self.infos, self.mef = ent, infos, mef
+        self.style = STYLES[mef["modele"]]
+        self.accent = _rgb(mef["couleur_accent"])
+        self.set_margins(15, 12, 15)
+        self.set_auto_page_break(True, margin=22)
+
+    def police(self, style, taille):
+        self.set_font("Helvetica", style, taille * self.style["echelle"])
+
+    def euro(self, x) -> str:
+        return f"{_num(x):,.2f}".replace(",", " ").replace(".", ",") + f" {self.mef['devise']}"
+
+    def filet(self, y, couleur=GRIS_FILET, epaisseur=0.3, x=None, largeur=LARGEUR_UTILE):
+        x = self.l_margin if x is None else x
+        self.set_draw_color(*couleur)
+        self.set_line_width(epaisseur)
+        self.line(x, y, x + largeur, y)
+        self.set_draw_color(0, 0, 0)
+        self.set_line_width(0.2)
+
+    def header(self):
+        if self.style["bandeau"]:
+            self.set_fill_color(*self.accent)
+            self.rect(0, 0, self.w, 3, "F")
+        if self.page_no() == 1:
+            self.set_y(12)
+            return
+        # en-tête allégé : raison sociale | rappel du cartouche
+        self.set_xy(self.l_margin, 8)
+        self.police("B", 10)
+        self.set_text_color(0, 0, 0)
+        raison = _txt(self.ent.get("raison_sociale") or "Mon entreprise")
+        self.cell(105, 6, _tronquer(self, raison, 103))
+        self.police("B", 9)
+        self.set_text_color(*self.accent)
+        rappel = _joindre(f"DEVIS n° {self.infos.get('numero')}", self.infos.get("date"), sep=" du ")
+        self.cell(75, 6, _tronquer(self, _txt(rappel), 74), align="R")
+        self.set_text_color(0, 0, 0)
+        self.filet(15.5)
+        self.set_y(19)
+
+    def footer(self):
+        e = self.ent
+        self.filet(self.h - 15)
+        self.set_xy(self.l_margin, self.h - 13.5)
+        self.set_font("Helvetica", "", 6.5)
+        self.set_text_color(*GRIS_TEXTE)
+        ident = _joindre(e.get("raison_sociale"),
+                         f"SIRET {e['siret']}" if e.get("siret") else "",
+                         f"TVA intra. {e['tva_intra']}" if e.get("tva_intra") else "",
+                         f"Tél. {e['telephone']}" if e.get("telephone") else "",
+                         e.get("email"))
+        self.cell(160, 4, _tronquer(self, _txt(ident), 158))
+        self.cell(20, 4, f"Page {self.page_no()}/{{nb}}", align="R")
+        self.set_text_color(0, 0, 0)
+
+
+def _bloc_texte(pdf, x, largeur, texte, taille, style="", couleur=(0, 0, 0), interligne=None):
+    """Paragraphe à gauche, ignoré s'il est vide (jamais de trou ni de libellé seul)."""
+    if not texte:
+        return
+    pdf.police(style, taille)
+    pdf.set_text_color(*couleur)
+    pdf.set_x(x)
+    pdf.multi_cell(largeur, (interligne or taille * 0.45) * pdf.style["echelle"], _txt(texte),
+                   align="L", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+
+def _nb_lignes(pdf, texte, largeur, taille, style="") -> int:
+    if not texte:
+        return 0
+    pdf.police(style, taille)
+    return len(pdf.multi_cell(largeur, 4, _txt(texte), dry_run=True, output="LINES"))
+
+
+def _entete_entreprise(pdf, e, x, largeur) -> float:
+    """Colonne identité : raison sociale > statut > coordonnées > identifiants
+    légaux (le logo est placé par l'appelant). Retourne le bas du bloc."""
+    _bloc_texte(pdf, x, largeur, e.get("raison_sociale") or "Mon entreprise", 14, "B", interligne=6.3)
+    fj, capital = e.get("forme_juridique"), e.get("capital")
+    statut = (f"{fj} au capital de {capital}" if fj and capital
+              else fj or (f"Capital social : {capital}" if capital else ""))
+    _bloc_texte(pdf, x, largeur, statut, 8.5, "I", GRIS_TEXTE)
+    pdf.ln(0.8)
+    _bloc_texte(pdf, x, largeur, e.get("adresse"), 9, interligne=4.3)
+    _bloc_texte(pdf, x, largeur, _joindre(f"Tél. {e['telephone']}" if e.get("telephone") else "",
+                                          e.get("email")), 9, interligne=4.3)
+    _bloc_texte(pdf, x, largeur, e.get("site_web"), 9, interligne=4.3)
+    legal = _joindre(f"SIRET {e['siret']}" if e.get("siret") else "",
+                     f"TVA intra. {e['tva_intra']}" if e.get("tva_intra") else "",
+                     f"APE {e['code_ape']}" if e.get("code_ape") else "")
+    if legal:
+        pdf.ln(1.2)
+        _bloc_texte(pdf, x, largeur, legal, 7.5, couleur=GRIS_TEXTE, interligne=3.5)
+    return pdf.get_y()
+
+
+def _cartouche(pdf, infos, ent, x, largeur) -> float:
+    """Cartouche devis : titre « DEVIS » + n°, date d'émission, validité (si activée)."""
+    st_, haut = pdf.style, pdf.get_y()
+    h_titre = 10 * st_["echelle"]
+    pdf.set_xy(x + 1, haut)
+    pdf.police("B", 15)
+    if st_["fond_cartouche"]:
+        pdf.set_fill_color(*pdf.accent)
+        pdf.rect(x, haut, largeur, h_titre, "F")
+        pdf.set_text_color(255, 255, 255)
+    else:
+        pdf.set_text_color(0, 0, 0)
+    pdf.cell(largeur - 2, h_titre, "DEVIS")
+    if not st_["fond_cartouche"]:
+        pdf.filet(haut + h_titre, pdf.accent, 0.5, x=x, largeur=largeur)
+    lignes = [("N°", infos.get("numero")), ("Date d'émission", infos.get("date"))]
+    if pdf.mef["section_validite"]:
+        lignes.append(("Validité", _validite(infos, ent)))
+    y = haut + h_titre + 2
+    for libelle, valeur in lignes:
+        if not valeur:
+            continue
+        pdf.set_xy(x + 1, y)
+        pdf.police("", 8.5)
+        pdf.set_text_color(*GRIS_TEXTE)
+        pdf.cell(29, 5, _txt(libelle))
+        pdf.police("B", 9)
+        pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(largeur - 31, 5 * st_["echelle"], _txt(valeur), align="L")
+        y = pdf.get_y() + 0.5
+    bas = y + 1.5
+    pdf.set_draw_color(*(_teinte(pdf.accent, 0.5) if st_["fond_cartouche"] else GRIS_FILET))
+    pdf.rect(x, haut, largeur, bas - haut, "D")
+    pdf.set_draw_color(0, 0, 0)
+    return bas
+
+
+def _bloc_client(pdf, infos, x, largeur) -> float:
+    """Bloc client encadré (omis entièrement s'il n'y a aucune info client)."""
+    haut = pdf.get_y()
+    nom, adresse, tel = infos.get("client"), infos.get("client_adresse"), infos.get("client_tel")
+    if not (nom or adresse or tel):
+        return haut
+    accent = pdf.style["cadre_client_accent"]
+    pdf.set_xy(x + 1, haut + 2)
+    pdf.police("B", 7.5)
+    pdf.set_text_color(*(pdf.accent if accent else GRIS_TEXTE))
+    pdf.cell(largeur - 2, 4, "CLIENT")
+    pdf.set_y(haut + 7 * pdf.style["echelle"])
+    _bloc_texte(pdf, x + 1, largeur - 2, nom, 10, "B", interligne=5)
+    _bloc_texte(pdf, x + 1, largeur - 2, adresse, 9, interligne=4.4)
+    _bloc_texte(pdf, x + 1, largeur - 2, f"Tél. {tel}" if tel else "", 9, interligne=4.4)
+    bas = pdf.get_y() + 2.5
+    pdf.set_draw_color(*(pdf.accent if accent else GRIS_FILET))
+    pdf.set_line_width(0.35 if accent else 0.3)
+    pdf.rect(x, haut, largeur, bas - haut, "D")
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.2)
+    return bas
+
+
+def _entete_page1(pdf, ent, infos):
+    """Logo (gauche / centre / droite ou masqué), colonne entreprise à gauche,
+    cartouche + client à droite. La suite démarre sous le plus bas des blocs."""
+    x, haut = pdf.l_margin, pdf.get_y()
+    x_droite = x + LARGEUR_UTILE - COL_DROITE
+    y_gauche = y_droite = haut
+    taille = _taille_logo(*pdf.style["logo"]) if pdf.mef["logo_afficher"] else None
+    if taille:
+        w, h = taille
+        position = pdf.mef["logo_position"]
+        if position == "centre":
+            x_logo = x + (LARGEUR_UTILE - w) / 2
+            y_gauche = y_droite = haut + h + 4
+        elif position == "droite":
+            x_logo = x + LARGEUR_UTILE - w
+            y_droite = haut + h + 3
+        else:
+            x_logo = x + pdf.c_margin
+            y_gauche = haut + h + 3
         try:
-            pdf.image(str(LOGO_PATH), x=150, y=8, w=45)
+            pdf.image(str(LOGO_PATH), x=x_logo, y=haut, w=w, h=h)
         except Exception:
-            pass
+            y_gauche = y_droite = haut
+    pdf.set_y(y_gauche)
+    bas_gauche = _entete_entreprise(pdf, ent, x, COL_GAUCHE)
+    pdf.set_y(y_droite)
+    bas_cartouche = _cartouche(pdf, infos, ent, x_droite, COL_DROITE)
+    pdf.set_y(bas_cartouche + 4)
+    bas_droite = _bloc_client(pdf, infos, x_droite, COL_DROITE)
+    pdf.set_y(max(bas_gauche, bas_droite) + 6 * pdf.style["echelle"])
 
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 7, _txt(entreprise.get("raison_sociale") or "Mon entreprise"), ln=True)
-    pdf.set_font("Helvetica", "", 9)
-    for info in [entreprise.get("forme_juridique"), entreprise.get("adresse"),
-                 f"SIRET : {entreprise.get('siret')}" if entreprise.get("siret") else None,
-                 f"TVA intra : {entreprise.get('tva_intra')}" if entreprise.get("tva_intra") else None]:
-        if info:
-            pdf.cell(0, 5, _txt(info), ln=True)
-    pdf.ln(3)
 
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 9, "DEVIS", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 5, _txt(f"Devis n° {infos.get('numero', '')}"), ln=True)
-    pdf.cell(0, 5, _txt(f"Date : {infos.get('date', '')}"), ln=True)
-    if infos.get("validite_jours"):
-        pdf.cell(0, 5, _txt(f"Validité de l'offre : {infos['validite_jours']} jours"), ln=True)
-    pdf.ln(2)
+def _objet_chantier(pdf, infos):
+    """Lignes « Objet » et « Chantier » sous l'en-tête (chacune omise si vide)."""
+    chantier = _joindre(f"début des travaux : {infos['date_debut']}" if infos.get("date_debut") else "",
+                        f"durée estimée : {infos['duree']}" if infos.get("duree") else "")
+    h = 5 * pdf.style["echelle"]
+    for libelle, valeur in (("Objet", infos.get("objet")), ("Chantier", chantier)):
+        if not valeur:
+            continue
+        pdf.set_x(pdf.l_margin + pdf.c_margin)
+        pdf.police("B", 9.5)
+        pdf.write(h, _txt(f"{libelle} : "))
+        pdf.police("", 9.5)
+        pdf.write(h, _txt(valeur))
+        pdf.ln(h + 0.5)
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 5, "Client", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    if infos.get("client"):
-        pdf.cell(0, 5, _txt(infos["client"]), ln=True)
-    if infos.get("client_adresse"):
-        pdf.multi_cell(0, 5, _txt(infos["client_adresse"]))
-    if infos.get("date_debut") or infos.get("duree"):
-        pdf.cell(0, 5, _txt(f"Début des travaux : {infos.get('date_debut') or '-'}   "
-                            f"Durée estimée : {infos.get('duree') or '-'}"), ln=True)
-    pdf.ln(2)
 
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(230, 230, 230)
-    pdf.cell(70, 7, "Désignation", border=1, fill=True)
-    pdf.cell(15, 7, "Unité", border=1, fill=True, align="C")
-    pdf.cell(20, 7, "Qté", border=1, fill=True, align="C")
-    pdf.cell(35, 7, "P.U. HT", border=1, fill=True, align="R")
-    pdf.cell(40, 7, "Montant HT", border=1, fill=True, align="R")
-    pdf.ln()
+def _entete_tableau(pdf):
+    st_ = pdf.style
+    h = 7.5 * st_["echelle"]
+    pdf.set_x(pdf.l_margin)
+    pdf.police("B", 8.5)
+    if st_["fond_entete"]:
+        pdf.set_fill_color(*pdf.accent)
+        pdf.set_text_color(255, 255, 255)
+    y = pdf.get_y()
+    for titre, largeur, align in COLONNES_PDF:
+        pdf.cell(largeur, h, _txt(titre), fill=st_["fond_entete"], align=align)
+    pdf.ln(h)
+    if not st_["fond_entete"]:
+        pdf.filet(y + h, pdf.accent, 0.5)
+    pdf.set_text_color(0, 0, 0)
 
+
+def _saut_de_page_tableau(pdf):
+    pdf.add_page()
+    _entete_tableau(pdf)
+
+
+def _ligne_tableau(pdf, lg, zebre):
+    """Une ligne : désignation sur plusieurs lignes si besoin, montants à droite ;
+    zébrage ou filet fin selon le modèle ; ne se coupe jamais entre deux pages."""
+    st_ = pdf.style
+    inter = st_["interligne"]
+    l_desig = COLONNES_PDF[0][1]
+    pdf.police("", 9)
+    designation = _txt(_texte(lg.get("designation")))
+    n = max(1, len(pdf.multi_cell(l_desig, inter, designation, dry_run=True, output="LINES")))
+    h = n * inter + st_["marge_ligne"]
+    if pdf.will_page_break(h):
+        _saut_de_page_tableau(pdf)
+        pdf.police("", 9)  # l'en-tête de page laisse une police grasse
+    x, y = pdf.l_margin, pdf.get_y()
+    if zebre and st_["zebre"]:
+        pdf.set_fill_color(*st_["zebre"])
+        pdf.rect(x, y, LARGEUR_UTILE, h, "F")
+    pdf.set_xy(x, y + st_["marge_ligne"] / 2)
+    pdf.multi_cell(l_desig, inter, designation, align="L")
+    pdf.set_xy(x + l_desig, y + st_["marge_ligne"] / 2)
+    valeurs = (_txt(_texte(lg.get("unite"))), _qte(lg.get("quantite")),
+               pdf.euro(lg.get("prix_unitaire")), pdf.euro(montant_ligne(lg)))
+    for (_, largeur, align), valeur in zip(COLONNES_PDF[1:], valeurs):
+        pdf.cell(largeur, inter, valeur, align=align)
+    if not st_["zebre"]:
+        pdf.filet(y + h, GRIS_LEGER, 0.1)
+    pdf.set_xy(x, y + h)
+
+
+def _tableau_lignes(pdf, lignes):
+    st_ = pdf.style
+    _entete_tableau(pdf)
+    if not lignes:
+        pdf.police("I", 9)
+        pdf.set_text_color(*GRIS_TEXTE)
+        pdf.cell(LARGEUR_UTILE, 9, "Aucune prestation chiffrée sur ce devis.", align="C",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
     groupes = OrderedDict()
     for lg in lignes:
-        groupes.setdefault(lg.get("groupe") or "", []).append(lg)
-    pdf.set_font("Helvetica", "", 9)
+        groupes.setdefault(_texte(lg.get("groupe")), []).append(lg)
+    h_section, h_sous_total = 7 * st_["echelle"], 6.5 * st_["echelle"]
+    rang = 0
     for nom_groupe, items in groupes.items():
         if nom_groupe:
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_fill_color(245, 245, 245)
-            pdf.cell(180, 7, _txt(nom_groupe), border=1, fill=True, ln=True)
-            pdf.set_font("Helvetica", "", 9)
+            if pdf.will_page_break(h_section + 10):   # pas de titre de section seul en bas de page
+                _saut_de_page_tableau(pdf)
+            pdf.set_x(pdf.l_margin)
+            pdf.police("B", 9)
+            y = pdf.get_y()
+            if st_["fond_section"]:
+                pdf.set_fill_color(*_teinte(pdf.accent, 0.85))
+                pdf.set_text_color(*pdf.accent)
+            pdf.cell(LARGEUR_UTILE, h_section, _txt(nom_groupe), fill=st_["fond_section"],
+                     new_x="LMARGIN", new_y="NEXT")
+            if not st_["fond_section"]:
+                pdf.filet(y + h_section, GRIS_FILET, 0.2)
+            pdf.set_text_color(0, 0, 0)
         for lg in items:
-            _ligne_tableau(pdf, lg["designation"], lg["unite"], lg["quantite"],
-                           lg["prix_unitaire"], lg["montant_ht"], euro)
+            _ligne_tableau(pdf, lg, zebre=rang % 2 == 1)
+            rang += 1
         if nom_groupe:
-            sous = sum(lg["montant_ht"] for lg in items)
-            pdf.set_font("Helvetica", "I", 9)
-            pdf.cell(140, 6, _txt(f"Sous-total {nom_groupe}"), align="R")
-            pdf.cell(40, 6, euro(sous), align="R", ln=True)
-            pdf.set_font("Helvetica", "", 9)
+            if pdf.will_page_break(h_sous_total):
+                _saut_de_page_tableau(pdf)
+            pdf.set_x(pdf.l_margin)
+            pdf.police("I", 8.5)
+            pdf.set_text_color(*GRIS_TEXTE)
+            pdf.cell(LARGEUR_UTILE - 32, h_sous_total, _txt(f"Sous-total {nom_groupe}"), align="R")
+            pdf.police("B", 9)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(32, h_sous_total, pdf.euro(sum(montant_ligne(lg) for lg in items)), align="R",
+                     new_x="LMARGIN", new_y="NEXT")
+    pdf.filet(pdf.get_y(), pdf.accent, 0.4)
 
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(140, 7, "Sous-total HT", align="R")
-    pdf.cell(40, 7, euro(totaux["sous_total_ht"]), align="R", ln=True)
-    if totaux.get("marge_pct"):
-        pdf.cell(140, 7, _txt(f"Marge ({totaux['marge_pct']:g} %)"), align="R")
-        pdf.cell(40, 7, euro(totaux.get("total_ht_brut", totaux["total_ht"]) - totaux["sous_total_ht"]),
-                 align="R", ln=True)
-    if totaux.get("remise_montant"):
-        lib = ("Remise" if totaux.get("remise_type") == "€"
-               else f"Remise ({totaux.get('remise_valeur', 0):g} %)")
-        pdf.cell(140, 7, _txt(lib), align="R")
-        pdf.cell(40, 7, "- " + euro(totaux["remise_montant"]), align="R", ln=True)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(140, 7, "Total HT", align="R")
-    pdf.cell(40, 7, euro(totaux["total_ht"]), align="R", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(140, 7, _txt(f"TVA ({totaux['tva_pct']:g} %)"), align="R")
-    pdf.cell(40, 7, euro(totaux["montant_tva"]), align="R", ln=True)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(140, 8, "TOTAL TTC", align="R")
-    pdf.cell(40, 8, euro(totaux["total_ttc"]), align="R", ln=True)
 
-    if infos.get("mentions"):
-        pdf.ln(3)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 5, "Mentions", ln=True)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 5, _txt(infos["mentions"]))
-    if entreprise.get("conditions_reglement"):
-        pdf.ln(3)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 5, "Conditions de règlement", ln=True)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 5, _txt(entreprise["conditions_reglement"]))
-    if entreprise.get("assurance_nom"):
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 5, "Assurance décennale", ln=True)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 5, _txt(f"{entreprise.get('assurance_nom')} - Police n° "
-                                  f"{entreprise.get('assurance_police', '')} - Couverture : "
-                                  f"{entreprise.get('assurance_couverture', '')}"))
+def _options_variantes(pdf, infos):
+    """Section « Options / variantes » non chiffrées (une option par ligne)."""
+    options = [o.strip(" -•\t") for o in (infos.get("options") or "").splitlines()]
+    options = [o for o in options if o]
+    if not (pdf.mef["section_options"] and options):
+        return
+    hauteur = 6 + 4.2 * sum(_nb_lignes(pdf, o, LARGEUR_UTILE - 6, 8.5) for o in options)
+    if pdf.will_page_break(min(hauteur, 40)):
+        pdf.add_page()
     pdf.ln(4)
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.multi_cell(0, 4, _txt("Devis reçu avant l'exécution des travaux, lu et accepté, bon pour accord."))
-    pdf.ln(8)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, "Date et signature du client :", ln=True)
+    _bloc_texte(pdf, pdf.l_margin, LARGEUR_UTILE, "Options / variantes (non comprises dans le total)",
+                9, "B", couleur=pdf.accent, interligne=5)
+    for option in options:
+        _bloc_texte(pdf, pdf.l_margin + 3, LARGEUR_UTILE - 3, f"- {option}", 8.5, interligne=4.2)
+
+
+def _mentions_legales(pdf) -> list:
+    """Pied du devis selon les sections activées ; champs vides omis."""
+    e, mef = pdf.ent, pdf.mef
+    mentions = []
+    if mef["section_paiement"] and e.get("conditions_reglement"):
+        mentions.append(f"Conditions de règlement : {e['conditions_reglement']}")
+    if mef["section_mentions"]:
+        decennale = ""
+        if e.get("assurance_nom") or e.get("assurance_police"):
+            decennale = _joindre(e.get("assurance_nom"),
+                                 f"police n° {e['assurance_police']}" if e.get("assurance_police") else "",
+                                 f"couverture : {e['assurance_couverture']}" if e.get("assurance_couverture") else "")
+        rc_pro = _joindre(e.get("rc_pro_nom"),
+                          f"police n° {e['rc_pro_police']}" if e.get("rc_pro_police") else "")
+        mentions += [m for m in (
+            f"Assurance décennale : {decennale}" if decennale else "",
+            f"Responsabilité civile professionnelle : {rc_pro}" if rc_pro else "",
+            f"Qualifications : {e['qualifications']}" if e.get("qualifications") else "",
+            e.get("mention_devis") or MENTION_DEVIS_DEFAUT,
+        ) if m]
+    return mentions
+
+
+def _bon_pour_accord(pdf, x_cadre, y, l_cadre=88.0) -> float:
+    """Cadre signature client : consigne + mention manuscrite, date, signature."""
+    h = H_ACCORD
+    fond = pdf.style["fond_section"]
+    if fond:
+        pdf.set_fill_color(*_teinte(pdf.accent, 0.85))
+        pdf.rect(x_cadre, y, l_cadre, 7, "F")
+    pdf.set_xy(x_cadre + 1, y)
+    pdf.police("B", 8.5)
+    pdf.set_text_color(*pdf.accent)
+    pdf.cell(l_cadre - 2, 7, "BON POUR ACCORD")
+    if not fond:
+        pdf.filet(y + 7, GRIS_FILET, 0.2, x=x_cadre, largeur=l_cadre)
+    pdf.set_xy(x_cadre + 1, y + 8.5)
+    pdf.police("I", 7.5)
+    pdf.set_text_color(*GRIS_TEXTE)
+    pdf.multi_cell(l_cadre - 2, 3.6, _txt(f"Daté, signé et précédé de la mention manuscrite : "
+                                          f"{MENTION_ACCORD}"), align="L")
+    yy = pdf.get_y() + 2
+    pdf.set_text_color(0, 0, 0)
+    pdf.police("", 8.5)
+    pdf.set_xy(x_cadre + 1, yy)
+    pdf.cell(l_cadre - 2, 4.5, "Date :")
+    pdf.set_xy(x_cadre + 1, yy + 6.5)
+    pdf.cell(l_cadre - 2, 4.5, "Signature du client :")
+    pdf.set_draw_color(*(_teinte(pdf.accent, 0.4) if fond else GRIS_FILET))
+    pdf.rect(x_cadre, y, l_cadre, h, "D")
+    pdf.set_draw_color(0, 0, 0)
+    return y + h
+
+
+def _bloc_final(pdf, infos, totaux):
+    """À gauche : remarques puis « Bon pour accord » (si activé) ; à droite :
+    totaux. Dessous : conditions / mentions légales. Le tout reste groupé
+    sur la dernière page."""
+    mef, ent = pdf.mef, pdf.ent
+    x, x_tot, l_tot, l_val = pdf.l_margin, pdf.l_margin + 95, 85.0, 34.0
+    t = totaux
+    marge, remise = _num(t.get("marge_pct")), _num(t.get("remise_montant"))
+    lignes_tot = []
+    if marge or remise:
+        lignes_tot.append(("Sous-total HT", t["sous_total_ht"], ""))
+    if marge:
+        lignes_tot.append((f"Marge ({marge:g} %)",
+                           t.get("total_ht_brut", t["total_ht"]) - t["sous_total_ht"], ""))
+    if remise:
+        lib = ("Remise" if t.get("remise_type") == "€"
+               else f"Remise ({_num(t.get('remise_valeur')):g} %)")
+        lignes_tot.append((lib, -remise, ""))
+    lignes_tot.append(("Total HT", t["total_ht"], "B"))
+    lignes_tot.append((f"TVA {_num(t.get('tva_pct')):g} %", t["montant_tva"], ""))
+    pct = _num(ent.get("acompte_pct")) if mef["section_paiement"] else 0.0
+    acompte = t["total_ttc"] * pct / 100 if 0 < pct <= 100 else 0.0
+    remarques = infos.get("mentions")
+    legales = _mentions_legales(pdf)
+
+    # tout le bloc doit tenir sur la page, sinon on passe à la suivante
+    h_tot = H_LIGNE_TOTAL * len(lignes_tot) + 10.5 + (6.5 if acompte else 0)
+    h_rem = 5 + 4 * _nb_lignes(pdf, remarques, 88, 8.5) if remarques else 0
+    h_gauche = (h_rem + 3 if remarques else 0) + (H_ACCORD if mef["section_accord"] else 0)
+    h_leg = 5 + 3.4 * sum(_nb_lignes(pdf, m, LARGEUR_UTILE, 7) for m in legales) if legales else 0
+    if pdf.will_page_break(4 + max(h_tot, h_gauche) + 5 + h_leg):
+        pdf.add_page()
+
+    haut = pdf.get_y() + 4
+    y = haut
+    for libelle, valeur, style in lignes_tot:
+        pdf.set_xy(x_tot, y)
+        pdf.police(style, 9.5)
+        pdf.cell(l_tot - l_val, H_LIGNE_TOTAL, _txt(libelle), align="R")
+        montant = ("- " + pdf.euro(-valeur)) if valeur < 0 else pdf.euro(valeur)
+        pdf.cell(l_val, H_LIGNE_TOTAL, montant, align="R")
+        y += H_LIGNE_TOTAL
+    y += 1.5
+    pdf.set_xy(x_tot, y)
+    pdf.police("B", 11)
+    if pdf.style["fond_ttc"]:
+        pdf.set_fill_color(*pdf.accent)
+        pdf.rect(x_tot, y, l_tot, 9, "F")
+        pdf.set_text_color(255, 255, 255)
+    else:
+        pdf.filet(y, pdf.accent, 0.5, x=x_tot, largeur=l_tot)
+        pdf.filet(y + 9, pdf.accent, 0.5, x=x_tot, largeur=l_tot)
+    pdf.cell(l_tot - l_val, 9, "TOTAL TTC", align="R")
+    pdf.cell(l_val, 9, pdf.euro(t["total_ttc"]), align="R")
+    pdf.set_text_color(0, 0, 0)
+    y += 9
+    if acompte:
+        pdf.set_xy(x_tot, y + 1)
+        pdf.police("I", 9)
+        pdf.cell(l_tot - l_val, 5.5, _txt(f"Acompte à la commande ({pct:g} %)"), align="R")
+        pdf.police("B", 9)
+        pdf.cell(l_val, 5.5, pdf.euro(acompte), align="R")
+        y += 6.5
+    bas_droite, y_gauche = y, haut
+    if remarques:
+        pdf.set_xy(x, haut)
+        pdf.police("B", 9)
+        pdf.cell(88, 5, "Remarques", new_x="LMARGIN", new_y="NEXT")
+        _bloc_texte(pdf, x, 88, remarques, 8.5, interligne=4)
+        y_gauche = pdf.get_y() + 3
+    bas_gauche = _bon_pour_accord(pdf, x, y_gauche) if mef["section_accord"] else y_gauche
+
+    if legales:
+        pdf.set_y(max(bas_droite, bas_gauche) + 5)
+        pdf.set_x(x)
+        pdf.police("B", 7.5)
+        pdf.set_text_color(*GRIS_TEXTE)
+        titre = "Informations légales" if mef["section_mentions"] else "Conditions de paiement"
+        pdf.cell(LARGEUR_UTILE, 4.5, titre, new_x="LMARGIN", new_y="NEXT")
+        for mention in legales:
+            _bloc_texte(pdf, x, LARGEUR_UTILE, mention, 7, couleur=GRIS_TEXTE, interligne=3.4)
+
+
+def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None):
+    """Devis PDF. Un seul moteur : le modèle (classique / moderne / compact),
+    la couleur, le logo et les sections viennent de `mise_en_forme` (complété
+    par les préférences de l'entreprise puis les défauts). Les montants
+    viennent de `totaux` (calculer_totaux) ; seul le sous-total de section est
+    sommé ici. Les coordonnées bancaires ne figurent jamais sur le devis.
+    `infos["options"]` : options / variantes non chiffrées, une par ligne."""
+    ent = {k: _texte(v) for k, v in (entreprise or {}).items() if not isinstance(v, dict)}
+    mef = normaliser_mise_en_forme(mise_en_forme_entreprise(entreprise or {}), mise_en_forme)
+    infos = {k: _texte(v) for k, v in (infos or {}).items()}
+    pdf = _PDFDevis(ent, infos, mef)
+    pdf.add_page()
+    _entete_page1(pdf, ent, infos)
+    _objet_chantier(pdf, infos)
+    pdf.ln(2)
+    _tableau_lignes(pdf, lignes or [])
+    _options_variantes(pdf, infos)
+    _bloc_final(pdf, infos, totaux)
     return bytes(pdf.output())
 
 
@@ -775,6 +1326,119 @@ def panneau_comptes():
 
 
 # ----------------------------------------------------------------------------
+# MISE EN FORME DU DEVIS (panneau de choix + aperçu)
+# ----------------------------------------------------------------------------
+_EXEMPLE_APERCU = {
+    "infos": {"numero": "DEV-EXEMPLE", "date": date.today().strftime("%d/%m/%Y"),
+              "client": "M. et Mme Exemple", "client_adresse": "1 rue de l'Exemple\n69000 Lyon",
+              "objet": "Remplacement chaudière par pompe à chaleur", "duree": "3 jours",
+              "options": "Robinets thermostatiques connectés\nDésembouage du réseau"},
+    "lignes": [
+        {"groupe": "Dépose", "designation": "Dépose chaudière existante", "unite": "forfait",
+         "quantite": 1, "prix_unitaire": 450.0},
+        {"groupe": "Installation", "designation": "Pompe à chaleur air/eau 11 kW", "unite": "u",
+         "quantite": 1, "prix_unitaire": 7900.0},
+        {"groupe": "Installation", "designation": "Tube cuivre 22 mm", "unite": "ml",
+         "quantite": 18, "prix_unitaire": 24.0},
+        {"groupe": "Installation", "designation": "Mise en service", "unite": "h",
+         "quantite": 3, "prix_unitaire": 65.0},
+    ],
+}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _apercu_png(ent_json, mef_json, devis_json, signature_logo):
+    """Page 1 du PDF en image (None si pypdfium2 n'est pas installé)."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    d = json.loads(devis_json)
+    pdf = generer_pdf_devis(json.loads(ent_json), d["infos"], d["lignes"], d["totaux"],
+                            mise_en_forme=json.loads(mef_json))
+    image = pdfium.PdfDocument(pdf)[0].render(scale=1.3).to_pil()
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def afficher_apercu(ent, mef, infos=None, lignes=None, totaux=None):
+    """Aperçu de la page 1 avec les choix courants (devis réel ou exemple)."""
+    if not lignes:
+        infos, lignes = _EXEMPLE_APERCU["infos"], _EXEMPLE_APERCU["lignes"]
+        totaux = calculer_totaux(lignes, 0, mef["tva_defaut"])
+    signature_logo = LOGO_PATH.stat().st_mtime if LOGO_PATH.exists() else 0
+    png = _apercu_png(json.dumps(ent, ensure_ascii=False, sort_keys=True, default=str),
+                      json.dumps(mef, sort_keys=True),
+                      json.dumps({"infos": infos, "lignes": lignes, "totaux": totaux},
+                                 ensure_ascii=False, sort_keys=True, default=str),
+                      signature_logo)
+    if png:
+        st.image(png, caption="Aperçu — page 1", width="stretch")
+    else:
+        st.info("Aperçu indisponible : installe le module pypdfium2 (requirements.txt).")
+
+
+def panneau_mise_en_forme(base: dict, cle: str) -> dict:
+    """Choix de mise en forme, préremplis avec `base`. Retourne le dict normalisé.
+    `cle` distingue les instances (entreprise, nouveau devis, devis en édition)."""
+    modeles = list(MODELES)
+    modele = st.radio("Modèle de devis", modeles, index=modeles.index(base["modele"]),
+                      format_func=MODELES.get, horizontal=True, key=f"{cle}_modele")
+    st.caption(DESCRIPTION_MODELES[modele])
+
+    noms = list(PALETTE_ACCENT) + ["Personnalisée"]
+    actuel = next((n for n, h in PALETTE_ACCENT.items() if h == base["couleur_accent"]), "Personnalisée")
+    c1, c2 = st.columns([2, 1])
+    choix = c1.selectbox("Couleur d'accent", noms, index=noms.index(actuel), key=f"{cle}_palette")
+    if choix == "Personnalisée":
+        couleur = c2.color_picker("Code couleur", base["couleur_accent"], key=f"{cle}_hex")
+    else:
+        couleur = PALETTE_ACCENT[choix]
+        c2.color_picker("Code couleur", couleur, disabled=True, key=f"{cle}_hex_{choix}")
+
+    c3, c4 = st.columns([1, 2])
+    logo = c3.toggle("Afficher le logo", base["logo_afficher"], key=f"{cle}_logo")
+    positions = list(POSITIONS_LOGO)
+    position = c4.radio("Position du logo", positions, index=positions.index(base["logo_position"]),
+                        format_func=POSITIONS_LOGO.get, horizontal=True, disabled=not logo,
+                        key=f"{cle}_logo_pos")
+
+    st.markdown("**Sections incluses**")
+    sections = {k: st.checkbox(lib, base[k], key=f"{cle}_{k}") for k, lib in SECTIONS_DEVIS.items()}
+
+    c5, c6 = st.columns(2)
+    tva = c5.selectbox("Taux de TVA par défaut", TVA_AUTORISEES,
+                       index=TVA_AUTORISEES.index(base["tva_defaut"]),
+                       format_func=lambda v: f"{v:g} %", key=f"{cle}_tva")
+    devise = c6.selectbox("Devise d'affichage", DEVISES, index=DEVISES.index(base["devise"]),
+                          key=f"{cle}_devise")
+    return normaliser_mise_en_forme({"modele": modele, "couleur_accent": couleur,
+                                     "logo_afficher": logo, "logo_position": position,
+                                     "tva_defaut": tva, "devise": devise, **sections})
+
+
+def choix_mise_en_forme_devis(mef_entreprise, surcharge, cle, options_init=""):
+    """Bloc « Mise en forme de ce devis » : suit l'entreprise ou personnalise.
+    Retourne (mise en forme effective, surcharge à stocker ou None, options)."""
+    perso = st.checkbox("Personnaliser la mise en forme pour ce devis",
+                        value=surcharge is not None, key=f"{cle}_perso",
+                        help="Décoché : le devis suit les préférences de l'entreprise "
+                             "(onglet 🎨 Mise en forme).")
+    if perso:
+        surcharge = panneau_mise_en_forme(normaliser_mise_en_forme(mef_entreprise, surcharge), cle)
+    else:
+        surcharge = None
+        st.caption(f"Préférences de l'entreprise : modèle {MODELES[mef_entreprise['modele']]}.")
+    effective = normaliser_mise_en_forme(mef_entreprise, surcharge)
+    options = ""
+    if effective["section_options"]:
+        options = st.text_area("Options / variantes non chiffrées (une par ligne)",
+                               value=options_init, key=f"{cle}_options", height=80)
+    return effective, surcharge, options
+
+
+# ----------------------------------------------------------------------------
 # ÉDITION D'UN DEVIS EXISTANT
 # ----------------------------------------------------------------------------
 def _df_edition(lignes) -> pd.DataFrame:
@@ -882,6 +1546,7 @@ def dialog_modifier_devis(numero, taux_horaire):
         except ValueError:
             d = date.today()
         etat = {"numero": numero, "rec": rec, "date_modif": comp["date_modif"],
+                "mef": comp["mise_en_forme"], "options": comp["options_variantes"],
                 "jeton": pysecrets.token_hex(4), "version": 0, "df": _df_edition(lignes_init),
                 "tva_hors_liste": tva not in TVA_AUTORISEES, "lignes_illisibles": illisible}
         st.session_state["ed_etat"] = etat
@@ -1000,15 +1665,20 @@ def dialog_modifier_devis(numero, taux_horaire):
     m[4].metric(f"TVA {tva_pct:g} %", eur(totaux["montant_tva"]))
     m[5].metric("Total TTC", eur(totaux["total_ttc"]))
 
+    # ---- Mise en forme propre à ce devis ----
+    ent = charger_entreprise()
+    with st.expander("🎨 Mise en forme de ce devis"):
+        mef_devis, surcharge_devis, options_devis = choix_mise_en_forme_devis(
+            mise_en_forme_entreprise(ent), etat["mef"], f"ed_mef_{etat['jeton']}", etat["options"])
+
     # ---- Actions ----
     bloque = bool(erreurs) or etat["lignes_illisibles"]
-    ent = charger_entreprise()
     vj = str(ent.get("validite_jours") or "").strip()
     infos = {"numero": numero, "client": client_nom, "client_adresse": client_adresse,
              "client_tel": "", "date": date_devis.strftime("%d/%m/%Y"),
              "validite": (date_devis + timedelta(days=int(vj))).strftime("%d/%m/%Y") if vj.isdigit() else None,
              "validite_jours": ent.get("validite_jours"), "date_debut": date_debut,
-             "duree": duree, "mentions": mentions.strip()}
+             "duree": duree, "mentions": mentions.strip(), "options": options_devis}
     champs = {"date_devis": str(date_devis), "client_nom": client_nom.strip(),
               "client_adresse": client_adresse, "date_debut": date_debut, "duree": duree,
               "marge_pct": float(marge_pct), "tva_pct": float(tva_pct),
@@ -1018,6 +1688,7 @@ def dialog_modifier_devis(numero, taux_horaire):
     if a1.button("💾 Enregistrer", type="primary", disabled=bloque, use_container_width=True):
         if mettre_a_jour_devis(numero, champs):
             enregistrer_complement(numero, remise_type, remise_valeur, mentions.strip())
+            enregistrer_mise_en_forme(numero, surcharge_devis, options_devis)
             _fermer_edition(f"Devis {numero} mis à jour.")
         else:
             st.error("Ce devis n'existe plus en base.")
@@ -1025,6 +1696,7 @@ def dialog_modifier_devis(numero, taux_horaire):
         nouveau = prochain_numero()
         if sauvegarder_devis({"numero": nouveau, **champs, "statut": "En attente"}):
             enregistrer_complement(nouveau, remise_type, remise_valeur, mentions.strip())
+            enregistrer_mise_en_forme(nouveau, surcharge_devis, options_devis)
             st.session_state.numero_courant = prochain_numero()  # évite un doublon côté « Nouveau devis »
             _fermer_edition(f"Nouveau devis {nouveau} créé à partir de {numero}.")
         else:
@@ -1032,7 +1704,7 @@ def dialog_modifier_devis(numero, taux_horaire):
     pdf_bytes = b""
     if not bloque:
         try:
-            pdf_bytes = generer_pdf_devis(ent, infos, lignes, totaux)
+            pdf_bytes = generer_pdf_devis(ent, infos, lignes, totaux, mise_en_forme=mef_devis)
         except Exception as exc:
             st.error(f"Génération PDF impossible : {exc}")
     a3.download_button("📄 Régénérer le PDF", pdf_bytes, f"{numero}.pdf", "application/pdf",
@@ -1072,14 +1744,28 @@ def main():
             logo_file = st.file_uploader("Logo (PNG / JPG)", type=["png", "jpg", "jpeg"], key="logo_up")
             ent["raison_sociale"] = st.text_input("Raison sociale", ent["raison_sociale"])
             ent["forme_juridique"] = st.text_input("Forme juridique", ent["forme_juridique"])
+            ent["capital"] = st.text_input("Capital social", ent["capital"], placeholder="Ex. 10 000 €")
             ent["adresse"] = st.text_area("Adresse", ent["adresse"])
+            ent["telephone"] = st.text_input("Téléphone", ent["telephone"])
+            ent["email"] = st.text_input("Email", ent["email"])
+            ent["site_web"] = st.text_input("Site web", ent["site_web"])
             ent["siret"] = st.text_input("SIRET", ent["siret"])
             ent["tva_intra"] = st.text_input("N° TVA intracommunautaire", ent["tva_intra"])
+            ent["code_ape"] = st.text_input("Code APE / NAF", ent["code_ape"], placeholder="Ex. 4322B")
             ent["assurance_nom"] = st.text_input("Assureur décennale", ent["assurance_nom"])
             ent["assurance_police"] = st.text_input("N° police décennale", ent["assurance_police"])
             ent["assurance_couverture"] = st.text_input("Couverture géographique", ent["assurance_couverture"])
+            ent["rc_pro_nom"] = st.text_input("Assureur RC pro", ent["rc_pro_nom"])
+            ent["rc_pro_police"] = st.text_input("N° police RC pro", ent["rc_pro_police"])
+            ent["qualifications"] = st.text_input("Qualifications", ent["qualifications"],
+                                                  placeholder="Ex. RGE QualiPAC, Qualibat 5211")
             ent["conditions_reglement"] = st.text_area("Conditions de règlement", ent["conditions_reglement"])
             ent["validite_jours"] = st.text_input("Validité du devis (jours)", ent["validite_jours"] or "30")
+            ent["acompte_pct"] = st.text_input("Acompte demandé à la commande (%)", ent["acompte_pct"],
+                                               placeholder="Vide = pas d'acompte")
+            ent["mention_devis"] = st.text_input("Mention en pied de devis",
+                                                 ent["mention_devis"] or MENTION_DEVIS_DEFAUT)
+            st.caption("Modèle, couleur, logo et sections : onglet 🎨 Mise en forme.")
             if st.button("💾 Enregistrer mon entreprise"):
                 enregistrer_entreprise(ent)
                 if logo_file is not None:
@@ -1087,8 +1773,11 @@ def main():
                 st.success("Infos entreprise enregistrées.")
                 st.rerun()
 
-    t_biblio, t_ens, t_clients, t_devis, t_suivi = st.tabs(
-        ["📚 Bibliothèque", "🧩 Ouvrages composés", "👥 Clients", "🧾 Nouveau devis", "📊 Suivi"])
+    mef_entreprise = mise_en_forme_entreprise(ent)
+
+    t_biblio, t_ens, t_clients, t_devis, t_suivi, t_forme = st.tabs(
+        ["📚 Bibliothèque", "🧩 Ouvrages composés", "👥 Clients", "🧾 Nouveau devis", "📊 Suivi",
+         "🎨 Mise en forme"])
 
     # ---- BIBLIOTHÈQUE ----
     with t_biblio:
@@ -1182,6 +1871,26 @@ def main():
         if st.button("💾 Enregistrer les clients"):
             enregistrer_clients(edite_c)
             st.success("Clients enregistrés.")
+
+    # ---- MISE EN FORME (préférences entreprise) ----
+    # Placé avant l'onglet Devis dans le code : son st.stop() (bibliothèque vide)
+    # ne doit pas empêcher d'accéder aux réglages.
+    with t_forme:
+        st.subheader("Mise en forme du devis")
+        st.caption("Préférences par défaut de l'entreprise, appliquées à tous les devis. "
+                   "Un devis peut les personnaliser (🧾 Nouveau devis ou ✏️ Modifier).")
+        c_choix, c_apercu = st.columns([1, 1], gap="large")
+        with c_choix:
+            mef_choisie = panneau_mise_en_forme(mef_entreprise, "mef_ent")
+            if st.button("💾 Enregistrer comme préférences de l'entreprise", type="primary"):
+                fichier = charger_entreprise()   # ne pas enregistrer les saisies de la barre latérale
+                fichier["mise_en_forme"] = mef_choisie
+                fichier.pop("couleur_accent", None)   # ancienne clé à plat
+                enregistrer_entreprise(fichier)
+                st.session_state["flash"] = "Préférences de mise en forme enregistrées."
+                st.rerun()
+        with c_apercu:
+            afficher_apercu(ent, mef_choisie)
 
     # ---- DEVIS ----
     with t_devis:
@@ -1328,7 +2037,9 @@ def main():
 
             cc1, cc2 = st.columns(2)
             marge_pct = cc1.number_input("Marge (%)", min_value=0.0, value=0.0, step=1.0)
-            tva_pct = cc2.selectbox("TVA (%)", options=[5.5, 10.0, 20.0], index=1)
+            tva_pct = cc2.selectbox("TVA (%)", options=TVA_AUTORISEES,
+                                    index=TVA_AUTORISEES.index(mef_entreprise["tva_defaut"]),
+                                    format_func=lambda v: f"{v:g} %")
 
             sous_total_ht = float(edited["montant_ht"].sum())
             total_ht = sous_total_ht * (1 + marge_pct / 100)
@@ -1351,6 +2062,14 @@ def main():
                      "validite_jours": ent.get("validite_jours"), "objet": objet,
                      "date_debut": date_debut, "duree": duree}
 
+            with st.expander("🎨 Mise en forme de ce devis"):
+                mef_devis, surcharge_devis, options_devis = choix_mise_en_forme_devis(
+                    mef_entreprise, None, "mef_nouveau")
+                if st.toggle("Afficher l'aperçu", key="mef_nouveau_apercu"):
+                    afficher_apercu(ent, mef_devis, dict(infos, options=options_devis),
+                                    st.session_state.devis_lignes, totaux)
+            infos["options"] = options_devis
+
             colA, colB, colC = st.columns(3)
             if colA.button("💾 Enregistrer ce devis"):
                 record = {"numero": st.session_state.numero_courant, "date_devis": str(date_devis),
@@ -1361,12 +2080,15 @@ def main():
                           "statut": "En attente"}
                 if sauvegarder_devis(record):
                     ancien = st.session_state.numero_courant
+                    if surcharge_devis or options_devis.strip():
+                        enregistrer_mise_en_forme(ancien, surcharge_devis, options_devis)
                     st.session_state.numero_courant = prochain_numero()
                     st.success(f"Devis {ancien} enregistré. Prochain n° : {st.session_state.numero_courant}.")
                 else:
                     st.error("Ce numéro existe déjà — enregistrement refusé (pas de doublon).")
 
-            pdf_bytes = generer_pdf_devis(ent, infos, st.session_state.devis_lignes, totaux)
+            pdf_bytes = generer_pdf_devis(ent, infos, st.session_state.devis_lignes, totaux,
+                                          mise_en_forme=mef_devis)
             colB.download_button("📄 Télécharger le devis (PDF)", pdf_bytes,
                                  f"{infos['numero']}.pdf", "application/pdf")
 
@@ -1433,8 +2155,10 @@ def main():
                          "client_adresse": rec["client_adresse"], "date": rec["date_devis"],
                          "validite_jours": charger_entreprise().get("validite_jours"),
                          "date_debut": rec["date_debut"], "duree": rec["duree"],
-                         "mentions": _texte(rec.get("mentions"))}
-            pdf_rec = generer_pdf_devis(charger_entreprise(), infos_rec, lignes_rec, totaux_rec)
+                         "mentions": _texte(rec.get("mentions")),
+                         "options": _texte(rec.get("options_variantes"))}
+            pdf_rec = generer_pdf_devis(charger_entreprise(), infos_rec, lignes_rec, totaux_rec,
+                                        mise_en_forme=surcharge_mise_en_forme(rec.get("mise_en_forme")))
             cP, cM = st.columns(2)
             cP.download_button("📄 Télécharger ce devis (PDF)", pdf_rec, f"{sel_pdf}.pdf",
                                "application/pdf", key="suivi_pdf_dl")
