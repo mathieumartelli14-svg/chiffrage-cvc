@@ -77,6 +77,7 @@ def init_db():
         con.execute(text("""CREATE TABLE IF NOT EXISTS devis_complements (
             numero TEXT PRIMARY KEY, remise_type TEXT, remise_valeur DOUBLE PRECISION,
             mentions TEXT, date_modif TEXT)"""))
+        con.execute(text("CREATE TABLE IF NOT EXISTS favoris (designation TEXT PRIMARY KEY)"))
     # migration douce : colonnes ajoutées après coup (jamais supprimées)
     _ajouter_colonnes("devis_complements", {"mise_en_forme": "TEXT", "options_variantes": "TEXT"})
     init_utilisateurs()
@@ -117,6 +118,18 @@ def enregistrer_bibliotheque(df):
         if c not in df.columns:
             df[c] = None
     _ecrire("ouvrages", df[COLONNES])
+
+
+def charger_favoris() -> list:
+    """Désignations des ouvrages marqués « postes fréquents »."""
+    return [d for d in _lire("favoris", ["designation"])["designation"].tolist() if not _vide(d)]
+
+
+def enregistrer_favoris(designations):
+    with get_engine().begin() as con:
+        con.execute(text("DELETE FROM favoris"))
+        for d in dict.fromkeys(designations):
+            con.execute(text("INSERT INTO favoris (designation) VALUES (:d)"), {"d": d})
 
 
 def charger_ensembles():
@@ -1270,9 +1283,10 @@ def check_password():
     return False
 
 
-def panneau_comptes():
+def panneau_comptes(zone=None):
+    zone = zone or st.sidebar
     if not st.session_state.get("is_admin"):
-        with st.sidebar.expander("🔑 Changer mon mot de passe"):
+        with zone.expander("🔑 Changer mon mot de passe", expanded=zone is st):
             a = st.text_input("Mot de passe actuel", type="password", key="chg_old")
             n1 = st.text_input("Nouveau mot de passe", type="password", key="chg_n1")
             n2 = st.text_input("Confirmer", type="password", key="chg_n2")
@@ -1287,7 +1301,7 @@ def panneau_comptes():
                     st.error("Mot de passe actuel incorrect.")
         return
 
-    with st.sidebar.expander("👤 Gestion des comptes (admin)"):
+    with zone.expander("👤 Gestion des comptes (admin)", expanded=zone is st):
         st.caption("Crée un compte par client. Le mot de passe n'est affiché qu'une fois.")
         st.markdown("**Créer un compte**")
         new_id = st.text_input("Identifiant du client", key="adm_id")
@@ -1424,7 +1438,7 @@ def choix_mise_en_forme_devis(mef_entreprise, surcharge, cle, options_init=""):
     perso = st.checkbox("Personnaliser la mise en forme pour ce devis",
                         value=surcharge is not None, key=f"{cle}_perso",
                         help="Décoché : le devis suit les préférences de l'entreprise "
-                             "(onglet 🎨 Mise en forme).")
+                             "(Mon entreprise > Présentation des devis).")
     if perso:
         surcharge = panneau_mise_en_forme(normaliser_mise_en_forme(mef_entreprise, surcharge), cle)
     else:
@@ -1697,7 +1711,8 @@ def dialog_modifier_devis(numero, taux_horaire):
         if sauvegarder_devis({"numero": nouveau, **champs, "statut": "En attente"}):
             enregistrer_complement(nouveau, remise_type, remise_valeur, mentions.strip())
             enregistrer_mise_en_forme(nouveau, surcharge_devis, options_devis)
-            st.session_state.numero_courant = prochain_numero()  # évite un doublon côté « Nouveau devis »
+            if not st.session_state.get("nd_enregistre"):  # évite un doublon côté « Nouveau devis »
+                st.session_state.numero_courant = prochain_numero()
             _fermer_edition(f"Nouveau devis {nouveau} créé à partir de {numero}.")
         else:
             st.error("Numéro déjà pris, réessaie.")
@@ -1714,6 +1729,421 @@ def dialog_modifier_devis(numero, taux_horaire):
 
 
 # ----------------------------------------------------------------------------
+# NOUVEAU DEVIS (parcours simplifié : un écran, 4 étapes)
+# ----------------------------------------------------------------------------
+NOUVEAU_CLIENT = "➕ Nouveau client"
+NB_POSTES_FREQUENTS = 8
+
+
+def _eur(x) -> str:
+    return f"{_num(x):,.2f} €".replace(",", " ").replace(".", ",")
+
+
+def _prix_ouvrage(o, taux_horaire):
+    """(fourniture, main-d'œuvre) d'une unité d'un ouvrage de la bibliothèque."""
+    fourn = _num(o.get("prix_fourniture"))
+    mo = prix_mo(_num(o.get("temps_mo")), _num(o.get("nb_poseurs")),
+                 _num(o.get("taux_horaire")) or taux_horaire)
+    return fourn, mo
+
+
+def _nouvelle_ligne(designation="", unite="u", quantite=1.0, fourn=0.0, mo=0.0, groupe="",
+                    pu=None, mo_active=True) -> dict:
+    """Ligne de devis en cours de saisie (« _id » sert de clé aux champs à l'écran)."""
+    return {"_id": pysecrets.token_hex(4), "groupe": groupe, "designation": designation,
+            "unite": unite or "u", "quantite": float(quantite), "prix_fourniture": fourn,
+            "mo_unit": mo, "mo_active": mo_active,
+            "prix_unitaire": fourn + mo if pu is None else pu}
+
+
+def _ajouter_ouvrage(o, taux_horaire, quantite=1.0, groupe=""):
+    fourn, mo = _prix_ouvrage(o, taux_horaire)
+    sans_mo = st.session_state.get("nd_sans_mo", False)
+    st.session_state.devis_lignes.append(_nouvelle_ligne(
+        _texte(o.get("designation")), _texte(o.get("unite")), quantite, fourn, mo, groupe,
+        pu=fourn + (0 if sans_mo else mo)))
+
+
+def lignes_propres(lignes) -> list:
+    """Lignes prêtes à enregistrer : sans « _id », fourniture / MO cohérents avec
+    le prix unitaire saisi, montant recalculé."""
+    propres = []
+    for lg in lignes:
+        q, pu = _num(lg.get("quantite")), _num(lg.get("prix_unitaire"))
+        fourn, mo, mo_active = _ventiler_pu(pu, _num(lg.get("prix_fourniture")), _num(lg.get("mo_unit")),
+                                            True if _vide(lg.get("mo_active")) else bool(lg.get("mo_active")))
+        propres.append({"groupe": _texte(lg.get("groupe")), "designation": _texte(lg.get("designation")),
+                        "unite": _texte(lg.get("unite")), "quantite": q, "prix_fourniture": fourn,
+                        "mo_unit": mo, "mo_active": bool(mo_active), "prix_unitaire": pu,
+                        "montant_ht": q * pu})
+    return propres
+
+
+def postes_frequents(biblio, devis, favoris, n=NB_POSTES_FREQUENTS) -> list:
+    """Index de la bibliothèque à proposer en accès rapide : les favoris choisis,
+    complétés par les ouvrages les plus utilisés dans les devis enregistrés."""
+    compte = {}
+    for brut in devis.get("lignes_json", []):
+        try:
+            for lg in json.loads(brut) if not _vide(brut) else []:
+                d = _texte(lg.get("designation"))
+                compte[d] = compte.get(d, 0) + 1
+        except (ValueError, AttributeError):
+            continue
+    par_designation = {}
+    for i in biblio.index:
+        par_designation.setdefault(_texte(biblio.loc[i, "designation"]), i)
+    ordre = list(favoris) + sorted(compte, key=compte.get, reverse=True)
+    index = []
+    for d in ordre:
+        i = par_designation.get(d)
+        if i is not None and i not in index:
+            index.append(i)
+    return index[:n]
+
+
+TAUX_HORAIRE_DEFAUT = 45.0
+_CLES_NON_CONSERVEES = ("nd_fav_", "nd_x_", "nd_pdf", "nd_excel", "nd_recherche", "nd_favoris_sel")
+
+
+def _conserver_saisie():
+    """Streamlit oublie les champs d'un écran dès qu'on en affiche un autre :
+    on reconduit la saisie du devis en cours pour pouvoir naviguer sans rien perdre."""
+    for cle in list(st.session_state):
+        c = str(cle)
+        if c.startswith(("nd_", "f_")) and not c.startswith(_CLES_NON_CONSERVEES):
+            st.session_state[cle] = st.session_state[cle]
+
+
+def _reinitialiser_devis(message=None):
+    """Repart d'un devis vierge : efface la saisie en cours et prend le numéro suivant."""
+    for cle in [c for c in st.session_state if str(c).startswith(("nd_", "f_"))]:
+        del st.session_state[cle]
+    # Les champs de l'en-tête restent affichés à chaque run : leur widget garde
+    # l'ancienne valeur si on se contente de supprimer la clé. On les vide donc
+    # explicitement (un callback peut écrire une clé de widget avant son rendu).
+    for cle in ("f_client_nom", "f_client_adresse", "f_date_debut", "f_duree",
+                "f_objet", "nd_remarques"):
+        st.session_state[cle] = ""
+    st.session_state["nd_client_sel"] = NOUVEAU_CLIENT
+    st.session_state.devis_lignes = []
+    st.session_state.numero_courant = prochain_numero()
+    if message:
+        st.session_state["flash"] = message
+
+
+def _cb_client(clients):
+    nom = st.session_state.get("nd_client_sel")
+    if nom and nom != NOUVEAU_CLIENT:
+        fiche = clients[clients["nom"] == nom].iloc[0]
+        st.session_state["f_client_nom"] = nom
+        st.session_state["f_client_adresse"] = _texte(fiche.get("adresse"))
+    else:
+        st.session_state["f_client_nom"] = ""
+        st.session_state["f_client_adresse"] = ""
+
+
+def _cb_dupliquer(devis):
+    numero = st.session_state.get("nd_dup_sel")
+    sel = devis[devis["numero"] == numero]
+    if sel.empty:
+        return
+    rec = sel.iloc[0]
+    try:
+        anciennes = json.loads(rec["lignes_json"]) if not _vide(rec.get("lignes_json")) else []
+    except ValueError:
+        anciennes = []
+    _reinitialiser_devis(f"Devis {numero} repris comme base : vérifie le client et les quantités.")
+    st.session_state.devis_lignes = [
+        _nouvelle_ligne(_texte(lg.get("designation")), _texte(lg.get("unite")), _num(lg.get("quantite")),
+                        _num(lg.get("prix_fourniture")), _num(lg.get("mo_unit")), _texte(lg.get("groupe")),
+                        pu=_num(lg.get("prix_unitaire")) if not _vide(lg.get("prix_unitaire")) else None,
+                        mo_active=True if _vide(lg.get("mo_active")) else bool(lg.get("mo_active")))
+        for lg in anciennes]
+    st.session_state["f_client_nom"] = _texte(rec.get("client_nom"))
+    st.session_state["f_client_adresse"] = _texte(rec.get("client_adresse"))
+    st.session_state["f_date_debut"] = _texte(rec.get("date_debut"))
+    st.session_state["f_duree"] = _texte(rec.get("duree"))
+    st.session_state["nd_marge"] = _num(rec.get("marge_pct"))
+    if _num(rec.get("tva_pct"), -1) in TVA_AUTORISEES:
+        st.session_state["nd_tva"] = _num(rec.get("tva_pct"))
+
+
+def _cb_recherche(biblio, ensembles, taux_horaire):
+    """Choisir dans la barre de recherche = ajouter tout de suite (quantité 1)."""
+    choix = st.session_state.get("nd_recherche")
+    if not choix:
+        return
+    genre, cle = choix
+    if genre == "e":
+        nb = 0
+        for _, comp in ensembles[ensembles["nom"] == cle].iterrows():
+            trouve = biblio[biblio["designation"] == comp["designation"]]
+            if not trouve.empty:
+                _ajouter_ouvrage(trouve.iloc[0].to_dict(), taux_horaire, _num(comp.get("quantite"), 1.0), cle)
+                nb += 1
+        st.session_state["flash"] = f"Ensemble « {cle} » ajouté ({nb} ligne(s))."
+    else:
+        o = biblio.loc[cle].to_dict()
+        _ajouter_ouvrage(o, taux_horaire)
+        st.session_state["flash"] = f"« {_texte(o.get('designation'))} » ajouté : indique la quantité."
+    st.session_state["nd_recherche"] = None
+
+
+def _cb_favori(o, taux_horaire):
+    _ajouter_ouvrage(o, taux_horaire)
+    st.session_state["flash"] = f"« {_texte(o.get('designation'))} » ajouté : indique la quantité."
+
+
+def _cb_ligne_libre():
+    st.session_state.devis_lignes.append(_nouvelle_ligne())
+
+
+def _cb_supprimer(identifiant):
+    st.session_state.devis_lignes = [lg for lg in st.session_state.devis_lignes
+                                     if lg.get("_id") != identifiant]
+
+
+def _cb_sans_mo():
+    """Bascule « fourniture seule » : recalcule le prix unitaire des lignes
+    venues de la bibliothèque (fourniture, avec ou sans main-d'œuvre)."""
+    sans_mo = st.session_state.get("nd_sans_mo", False)
+    for lg in st.session_state.devis_lignes:
+        if _num(lg.get("mo_unit")):
+            pu = _num(lg.get("prix_fourniture")) + (0 if sans_mo else _num(lg.get("mo_unit")))
+            lg["prix_unitaire"] = pu
+            st.session_state[f"nd_pu_{lg['_id']}"] = pu
+
+
+def onglet_nouveau_devis(ent, mef_entreprise, taux_horaire):
+    lignes = st.session_state.devis_lignes
+    for lg in lignes:
+        lg.setdefault("_id", pysecrets.token_hex(4))
+    biblio, clients, devis = charger_bibliotheque(), charger_clients(), charger_devis()
+    ensembles = charger_ensembles()
+    numero = st.session_state.numero_courant
+    deja_enregistre = st.session_state.get("nd_enregistre", False)
+    st.session_state.setdefault("nd_tva", mef_entreprise["tva_defaut"])
+    st.session_state.setdefault("nd_marge", 0.0)
+    st.session_state.setdefault("nd_date", date.today())
+
+    # ---- En-tête : numéro + points de départ ----
+    h1, h2, h3 = st.columns([3, 2, 2], vertical_alignment="center")
+    h1.subheader(f"Devis n° {numero}")
+    with h2.popover("📋 Partir d'un ancien devis", use_container_width=True, disabled=devis.empty):
+        if not devis.empty:
+            libelles = {r["numero"]: f"{r['numero']} — {_texte(r['client_nom'])} — {r['date_devis']}"
+                        for _, r in devis.iterrows()}
+            st.selectbox("Devis à reprendre", devis["numero"].tolist()[::-1],
+                         format_func=lambda n: libelles.get(n, n), key="nd_dup_sel")
+            if lignes:
+                st.caption("⚠️ Remplace le devis en cours de saisie.")
+            st.button("Utiliser ce devis comme base", type="primary", use_container_width=True,
+                      on_click=_cb_dupliquer, args=(devis,))
+    with h3.popover("🆕 Nouveau devis vierge", use_container_width=True):
+        st.write("La saisie en cours sera effacée." if lignes and not deja_enregistre
+                 else "Repartir d'un devis vide.")
+        st.button("Oui, repartir de zéro", type="primary", use_container_width=True,
+                  on_click=_reinitialiser_devis, args=("Nouveau devis vierge prêt.",))
+    if deja_enregistre:
+        st.success(f"Devis {numero} enregistré. Si tu le modifies, clique de nouveau sur "
+                   "« Enregistrer » pour le mettre à jour. Sinon : « 🆕 Nouveau devis vierge ».")
+
+    # ---- ① Client ----
+    st.markdown("#### ① Client")
+    noms = sorted({_texte(n) for n in clients["nom"]} - {""})
+    if noms:
+        st.selectbox("Client déjà enregistré", [NOUVEAU_CLIENT] + noms, key="nd_client_sel",
+                     on_change=_cb_client, args=(clients,),
+                     help="Tape quelques lettres pour le retrouver : nom et adresse se remplissent.")
+    c1, c2 = st.columns(2)
+    client_nom = c1.text_input("Nom du client", key="f_client_nom")
+    client_adresse = c2.text_area("Adresse", key="f_client_adresse", height=80)
+    client_inconnu = bool(client_nom.strip()) and client_nom.strip() not in noms
+    st.session_state.setdefault("nd_memoriser", True)
+    memoriser = (st.checkbox("Mémoriser ce client pour les prochains devis", key="nd_memoriser")
+                 if client_inconnu else False)
+    with st.expander("Plus d'infos : date, objet, chantier, remarques"):
+        d1, d2, d3 = st.columns(3)
+        date_devis = d1.date_input("Date du devis", format="DD/MM/YYYY", key="nd_date")
+        date_debut = d2.text_input("Début des travaux", key="f_date_debut")
+        duree = d3.text_input("Durée estimée", key="f_duree")
+        objet = st.text_input("Objet du devis", key="f_objet",
+                              placeholder="Ex. Remplacement chaudière par pompe à chaleur")
+        remarques = st.text_area("Remarques imprimées sur le devis", key="nd_remarques", height=68)
+
+    # ---- ② Ajouter des postes ----
+    st.markdown("#### ② Ajouter des postes")
+    if biblio.empty:
+        st.info("Ta bibliothèque de prix est vide : remplis-la dans « Mes prix » (menu de gauche), "
+                "ou ajoute des lignes libres ci-dessous.")
+    else:
+        choix = [("o", i) for i in biblio.index if _texte(biblio.loc[i, "designation"])]
+        choix += [("e", nom) for nom in sorted({_texte(n) for n in ensembles["nom"]} - {""})]
+
+        def libelle(c):
+            if c[0] == "e":
+                return f"🧩 {c[1]} (ensemble)"
+            o = biblio.loc[c[1]]
+            code = f"  [{_texte(o.get('code'))}]" if _texte(o.get("code")) else ""
+            return f"{_texte(o['designation'])} — {_eur(sum(_prix_ouvrage(o, taux_horaire)))} / {_texte(o.get('unite')) or 'u'}{code}"
+
+        st.selectbox("🔍 Chercher dans ma bibliothèque", choix, index=None, format_func=libelle,
+                     placeholder="Tape quelques lettres (ex. radiateur, cuivre…) puis choisis : c'est ajouté",
+                     key="nd_recherche", on_change=_cb_recherche, args=(biblio, ensembles, taux_horaire))
+        favoris = charger_favoris()
+        frequents = postes_frequents(biblio, devis, favoris)
+        if frequents:
+            st.caption("⭐ Postes fréquents — un clic pour ajouter")
+            colonnes = st.columns(4)
+            for k, i in enumerate(frequents):
+                o = biblio.loc[i].to_dict()
+                colonnes[k % 4].button(_texte(o.get("designation"))[:45], key=f"nd_fav_{i}",
+                                       use_container_width=True, on_click=_cb_favori,
+                                       args=(o, taux_horaire))
+    b1, b2 = st.columns(2)
+    b1.button("➕ Ligne libre (hors bibliothèque)", use_container_width=True, on_click=_cb_ligne_libre)
+    with b2.popover("⭐ Choisir mes postes fréquents", use_container_width=True, disabled=biblio.empty):
+        if not biblio.empty:
+            designations = sorted({_texte(d) for d in biblio["designation"]} - {""})
+            choisis = st.multiselect("Ouvrages à garder sous la main", designations,
+                                     default=[f for f in favoris if f in designations],
+                                     key="nd_favoris_sel")
+            st.caption("Sans choix de ta part, l'outil propose les ouvrages que tu utilises le plus.")
+            if st.button("Enregistrer mes postes fréquents", use_container_width=True):
+                enregistrer_favoris(choisis)
+                st.session_state["flash"] = "Postes fréquents enregistrés."
+                st.rerun()
+
+    # ---- ③ Lignes du devis ----
+    st.markdown("#### ③ Lignes du devis")
+    erreurs = []
+    if not lignes:
+        st.info("Aucune ligne pour l'instant : cherche un ouvrage ou clique sur un poste fréquent.")
+    groupe_precedent = ""
+    for n, lg in enumerate(lignes, start=1):
+        i = lg["_id"]
+        groupe = _texte(lg.get("groupe"))
+        if groupe and groupe != groupe_precedent:
+            st.caption(f"🧩 {groupe}")
+        groupe_precedent = groupe
+        c = st.columns([5, 1.3, 1.8, 2, 1.8, 0.8], vertical_alignment="bottom")
+        # valeurs initiales posées dans l'état (pas de « value= ») : la saisie survit
+        # au changement d'écran, voir _conserver_saisie
+        st.session_state.setdefault(f"nd_d_{i}", _texte(lg.get("designation")))
+        st.session_state.setdefault(f"nd_u_{i}", _texte(lg.get("unite")))
+        st.session_state.setdefault(f"nd_q_{i}", max(_num(lg.get("quantite")), 0.0))
+        st.session_state.setdefault(f"nd_pu_{i}", max(_num(lg.get("prix_unitaire")), 0.0))
+        lg["designation"] = c[0].text_input("Désignation", key=f"nd_d_{i}",
+                                            placeholder="Désignation du poste")
+        lg["unite"] = c[1].text_input("Unité", key=f"nd_u_{i}")
+        lg["quantite"] = c[2].number_input("Quantité", min_value=0.0, step=1.0, key=f"nd_q_{i}")
+        lg["prix_unitaire"] = c[3].number_input("Prix unitaire HT (€)", min_value=0.0, step=1.0,
+                                                format="%.2f", key=f"nd_pu_{i}")
+        c[4].markdown(f"**{_eur(lg['quantite'] * lg['prix_unitaire'])}**")
+        c[5].button("🗑️", key=f"nd_x_{i}", help="Supprimer cette ligne",
+                    on_click=_cb_supprimer, args=(i,))
+        if not lg["designation"].strip():
+            erreurs.append(f"Ligne {n} : indique une désignation, ou supprime la ligne.")
+    for e in erreurs:
+        st.warning(e)
+
+    with st.expander("⚙️ Options : TVA, marge, remise, main-d'œuvre, présentation"):
+        o1, o2, o3, o4 = st.columns(4)
+        tva_pct = o1.selectbox("TVA", TVA_AUTORISEES, format_func=lambda v: f"{v:g} %", key="nd_tva")
+        marge_pct = o2.number_input("Marge (%)", min_value=0.0, step=1.0, key="nd_marge")
+        remise_type = o3.radio("Remise en", ["%", "€"], horizontal=True, key="nd_remise_type")
+        remise_valeur = o4.number_input(f"Remise ({remise_type})", min_value=0.0, step=1.0,
+                                        key="nd_remise_valeur")
+        st.checkbox("Fourniture seule (sans main-d'œuvre)", key="nd_sans_mo", on_change=_cb_sans_mo,
+                    help="Recalcule le prix des lignes venues de la bibliothèque, avec ou sans pose.")
+        st.markdown("**Présentation du devis**")
+        mef_devis, surcharge_devis, options_devis = choix_mise_en_forme_devis(
+            mef_entreprise, None, "nd_mef")
+
+    propres = lignes_propres(lignes)
+    totaux = calculer_totaux(propres, marge_pct, tva_pct, remise_type, remise_valeur)
+    if remise_type == "%" and remise_valeur > 100:
+        erreurs.append("Remise : 100 % maximum.")
+    if remise_type == "€" and remise_valeur > totaux["total_ht_brut"] + 1e-9:
+        erreurs.append("La remise dépasse le total HT.")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total HT", _eur(totaux["total_ht"]))
+    m2.metric(f"TVA {tva_pct:g} %", _eur(totaux["montant_tva"]))
+    m3.metric("Total TTC", _eur(totaux["total_ttc"]))
+    details = [f"marge {marge_pct:g} % : + {_eur(totaux['total_ht_brut'] - totaux['sous_total_ht'])}"
+               if marge_pct else "",
+               f"remise : - {_eur(totaux['remise_montant'])}" if totaux["remise_montant"] else ""]
+    if any(details):
+        st.caption("Total HT calculé avec " + " et ".join(d for d in details if d) + ".")
+
+    # ---- ④ Terminer ----
+    st.markdown("#### ④ Terminer")
+    vj = str(ent.get("validite_jours") or "").strip()
+    infos = {"numero": numero, "client": client_nom, "client_adresse": client_adresse, "client_tel": "",
+             "date": date_devis.strftime("%d/%m/%Y"),
+             "validite": (date_devis + timedelta(days=int(vj))).strftime("%d/%m/%Y") if vj.isdigit() else None,
+             "validite_jours": ent.get("validite_jours"), "objet": objet, "date_debut": date_debut,
+             "duree": duree, "mentions": remarques.strip(), "options": options_devis}
+    pret = bool(lignes) and not erreurs
+
+    a1, a2, a3 = st.columns(3)
+    if a1.button("💾 Enregistrer le devis", type="primary", use_container_width=True):
+        bloquants = (["Indique le nom du client (étape ①)."] if not client_nom.strip() else []) \
+            + (["Ajoute au moins une ligne (étape ②)."] if not lignes else []) + erreurs
+        if bloquants:
+            for b in bloquants:
+                st.error(b)
+        else:
+            champs = {"date_devis": str(date_devis), "client_nom": client_nom.strip(),
+                      "client_adresse": client_adresse, "date_debut": date_debut, "duree": duree,
+                      "marge_pct": float(marge_pct), "tva_pct": float(tva_pct),
+                      "lignes_json": json.dumps(propres, ensure_ascii=False)}
+            if deja_enregistre:
+                ok = mettre_a_jour_devis(numero, champs)
+            else:
+                ok = sauvegarder_devis({"numero": numero, **champs, "statut": "En attente"})
+                if not ok:  # numéro pris entre-temps (autre poste) : on prend le suivant
+                    numero = prochain_numero()
+                    st.session_state.numero_courant = numero
+                    ok = sauvegarder_devis({"numero": numero, **champs, "statut": "En attente"})
+            if not ok:
+                st.error("Enregistrement impossible, réessaie.")
+            else:
+                if deja_enregistre or remise_valeur or remarques.strip():
+                    enregistrer_complement(numero, remise_type, remise_valeur, remarques.strip())
+                if deja_enregistre or surcharge_devis or options_devis.strip():
+                    enregistrer_mise_en_forme(numero, surcharge_devis, options_devis)
+                if memoriser:
+                    enregistrer_clients(pd.concat(
+                        [clients, pd.DataFrame([{"nom": client_nom.strip(), "adresse": client_adresse}])],
+                        ignore_index=True))
+                st.session_state["nd_enregistre"] = True
+                st.session_state["flash"] = (f"Devis {numero} mis à jour." if deja_enregistre
+                                             else f"Devis {numero} enregistré.")
+                st.rerun()
+    voir = a2.toggle("👁️ Voir l'aperçu", key="nd_apercu", disabled=not pret)
+    pdf_bytes = b""
+    if pret:
+        try:
+            pdf_bytes = generer_pdf_devis(ent, infos, propres, totaux, mise_en_forme=mef_devis)
+        except Exception as exc:
+            st.error(f"PDF impossible à générer : {exc}")
+    a3.download_button("📄 Télécharger le PDF", pdf_bytes, f"{numero}.pdf", "application/pdf",
+                       disabled=not pdf_bytes, use_container_width=True, key="nd_pdf")
+    if not pret and lignes:
+        st.caption("Corrige les lignes signalées pour débloquer l'aperçu et le PDF.")
+    if voir and pret:
+        afficher_apercu(ent, mef_devis, infos, propres, totaux)
+    if pret:
+        with st.expander("Autres exports"):
+            st.download_button("📊 Exporter ce devis (Excel)", generer_excel_devis(ent, infos, propres, totaux),
+                               f"{numero}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="nd_excel")
+
+
+# ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
 def main():
@@ -1726,62 +2156,19 @@ def main():
     if "numero_courant" not in st.session_state:
         st.session_state.numero_courant = prochain_numero()
 
-    st.title("Module chiffrage CVC")
     flash = st.session_state.pop("flash", None)
     if flash:
         st.toast(flash, icon="✅")
+    _conserver_saisie()
 
-    with st.sidebar:
-        panneau_comptes()
-        st.header("Réglages généraux")
-        taux_horaire = st.number_input("Taux horaire par défaut (€/h)", min_value=0.0, value=45.0, step=1.0)
-        st.caption("Taux par défaut. Tu peux en fixer un par ouvrage dans la biblio. "
-                   "Coût MO = temps pose × nb poseurs × taux.")
-        ent = charger_entreprise()
-        with st.expander("🏢 Mon entreprise (à remplir une fois)"):
-            if LOGO_PATH.exists():
-                st.image(str(LOGO_PATH), width=120, caption="Logo actuel")
-            logo_file = st.file_uploader("Logo (PNG / JPG)", type=["png", "jpg", "jpeg"], key="logo_up")
-            ent["raison_sociale"] = st.text_input("Raison sociale", ent["raison_sociale"])
-            ent["forme_juridique"] = st.text_input("Forme juridique", ent["forme_juridique"])
-            ent["capital"] = st.text_input("Capital social", ent["capital"], placeholder="Ex. 10 000 €")
-            ent["adresse"] = st.text_area("Adresse", ent["adresse"])
-            ent["telephone"] = st.text_input("Téléphone", ent["telephone"])
-            ent["email"] = st.text_input("Email", ent["email"])
-            ent["site_web"] = st.text_input("Site web", ent["site_web"])
-            ent["siret"] = st.text_input("SIRET", ent["siret"])
-            ent["tva_intra"] = st.text_input("N° TVA intracommunautaire", ent["tva_intra"])
-            ent["code_ape"] = st.text_input("Code APE / NAF", ent["code_ape"], placeholder="Ex. 4322B")
-            ent["assurance_nom"] = st.text_input("Assureur décennale", ent["assurance_nom"])
-            ent["assurance_police"] = st.text_input("N° police décennale", ent["assurance_police"])
-            ent["assurance_couverture"] = st.text_input("Couverture géographique", ent["assurance_couverture"])
-            ent["rc_pro_nom"] = st.text_input("Assureur RC pro", ent["rc_pro_nom"])
-            ent["rc_pro_police"] = st.text_input("N° police RC pro", ent["rc_pro_police"])
-            ent["qualifications"] = st.text_input("Qualifications", ent["qualifications"],
-                                                  placeholder="Ex. RGE QualiPAC, Qualibat 5211")
-            ent["conditions_reglement"] = st.text_area("Conditions de règlement", ent["conditions_reglement"])
-            ent["validite_jours"] = st.text_input("Validité du devis (jours)", ent["validite_jours"] or "30")
-            ent["acompte_pct"] = st.text_input("Acompte demandé à la commande (%)", ent["acompte_pct"],
-                                               placeholder="Vide = pas d'acompte")
-            ent["mention_devis"] = st.text_input("Mention en pied de devis",
-                                                 ent["mention_devis"] or MENTION_DEVIS_DEFAUT)
-            st.caption("Modèle, couleur, logo et sections : onglet 🎨 Mise en forme.")
-            if st.button("💾 Enregistrer mon entreprise"):
-                enregistrer_entreprise(ent)
-                if logo_file is not None:
-                    LOGO_PATH.write_bytes(logo_file.getvalue())
-                st.success("Infos entreprise enregistrées.")
-                st.rerun()
-
+    ent = charger_entreprise()
+    est_admin = bool(st.session_state.get("is_admin"))
+    taux_horaire = _num(ent.get("taux_horaire"), TAUX_HORAIRE_DEFAUT) or TAUX_HORAIRE_DEFAUT
     mef_entreprise = mise_en_forme_entreprise(ent)
 
-    t_biblio, t_ens, t_clients, t_devis, t_suivi, t_forme = st.tabs(
-        ["📚 Bibliothèque", "🧩 Ouvrages composés", "👥 Clients", "🧾 Nouveau devis", "📊 Suivi",
-         "🎨 Mise en forme"])
-
+    # Chaque écran est une fonction ; le menu (en bas de main) les regroupe par usage.
     # ---- BIBLIOTHÈQUE ----
-    with t_biblio:
-        st.subheader("Mes ouvrages et prix")
+    def ecran_ouvrages():
         with st.expander("📥 Importer / exporter"):
             modele = pd.DataFrame([["P001", "Radiateur acier 1000W", "u", 120.0, 1.5, 1, None]], columns=COLONNES)
             st.download_button("Télécharger le modèle CSV", modele.to_csv(index=False).encode("utf-8"),
@@ -1829,14 +2216,14 @@ def main():
             key="editeur_biblio")
         if st.button("💾 Enregistrer la bibliothèque"):
             enregistrer_bibliotheque(edite)
-            st.success("Bibliothèque enregistrée.")
+            st.toast("Bibliothèque enregistrée.", icon="✅")
 
     # ---- OUVRAGES COMPOSÉS ----
-    with t_ens:
-        st.subheader("Ouvrages composés (ensembles)")
+    def ecran_ensembles():
+        st.caption("Un ensemble regroupe plusieurs ouvrages à ajouter d'un coup dans un devis.")
         biblio = charger_bibliotheque()
         if biblio.empty:
-            st.warning("Ajoute d'abord des ouvrages dans la bibliothèque.")
+            st.warning("Ajoute d'abord des ouvrages dans l'onglet Ouvrages.")
         else:
             designations = biblio["designation"].dropna().tolist()
             ens_all = charger_ensembles()
@@ -1860,8 +2247,8 @@ def main():
                     st.rerun()
 
     # ---- CLIENTS ----
-    with t_clients:
-        st.subheader("Base clients")
+    def page_clients():
+        st.header("👥 Mes clients")
         edite_c = st.data_editor(
             charger_clients(), num_rows="dynamic", use_container_width=True,
             column_config={
@@ -1870,15 +2257,12 @@ def main():
             key="editeur_clients")
         if st.button("💾 Enregistrer les clients"):
             enregistrer_clients(edite_c)
-            st.success("Clients enregistrés.")
+            st.toast("Clients enregistrés.", icon="✅")
 
     # ---- MISE EN FORME (préférences entreprise) ----
-    # Placé avant l'onglet Devis dans le code : son st.stop() (bibliothèque vide)
-    # ne doit pas empêcher d'accéder aux réglages.
-    with t_forme:
-        st.subheader("Mise en forme du devis")
+    def ecran_presentation():
         st.caption("Préférences par défaut de l'entreprise, appliquées à tous les devis. "
-                   "Un devis peut les personnaliser (🧾 Nouveau devis ou ✏️ Modifier).")
+                   "Un devis peut les personnaliser (écran Nouveau devis ou bouton ✏️ Modifier).")
         c_choix, c_apercu = st.columns([1, 1], gap="large")
         with c_choix:
             mef_choisie = panneau_mise_en_forme(mef_entreprise, "mef_ent")
@@ -1892,220 +2276,9 @@ def main():
         with c_apercu:
             afficher_apercu(ent, mef_choisie)
 
-    # ---- DEVIS ----
-    with t_devis:
-        biblio = charger_bibliotheque()
-        if biblio.empty:
-            st.warning("La bibliothèque est vide.")
-            st.stop()
-
-        saved = charger_devis()
-        with st.expander("📋 Repartir d'un devis existant (dupliquer)"):
-            if saved.empty:
-                st.caption("Aucun devis enregistré.")
-            else:
-                libelles = {r["numero"]: f"{r['numero']} — {r['client_nom'] or ''} — {r['date_devis']}"
-                            for _, r in saved.iterrows()}
-                src = st.selectbox("Devis à dupliquer", saved["numero"].tolist(),
-                                   format_func=lambda n: libelles.get(n, n))
-                if st.button("Dupliquer ce devis"):
-                    rec = saved[saved["numero"] == src].iloc[0]
-                    st.session_state.devis_lignes = json.loads(rec["lignes_json"]) if rec["lignes_json"] else []
-                    st.session_state["f_client_nom"] = rec["client_nom"] or ""
-                    st.session_state["f_client_adresse"] = rec["client_adresse"] or ""
-                    st.session_state["f_date_debut"] = rec["date_debut"] or ""
-                    st.session_state["f_duree"] = rec["duree"] or ""
-                    st.session_state.numero_courant = prochain_numero()
-                    st.rerun()
-
-        clients = charger_clients()
-        if not clients.empty:
-            cc = st.columns([3, 1])
-            sel_cli = cc[0].selectbox("Pré-remplir depuis la base clients", ["—"] + clients["nom"].tolist())
-            if cc[1].button("Utiliser", use_container_width=True) and sel_cli != "—":
-                row = clients[clients["nom"] == sel_cli].iloc[0]
-                st.session_state["f_client_nom"] = sel_cli
-                st.session_state["f_client_adresse"] = row["adresse"] or ""
-                st.rerun()
-
-        col1, col2, col3 = st.columns(3)
-        col1.text_input("N° de devis (auto)", value=st.session_state.numero_courant, disabled=True)
-        date_devis = col2.date_input("Date", value=date.today())
-        col3.empty()
-        col4, col5, col6 = st.columns(3)
-        client_nom = col4.text_input("Nom du client", key="f_client_nom")
-        client_adresse = col4.text_area("Adresse du client", key="f_client_adresse", height=80)
-        date_debut = col5.text_input("Début des travaux", key="f_date_debut")
-        duree = col6.text_input("Durée estimée", key="f_duree")
-        objet = st.text_input("Objet du devis", key="f_objet",
-                              placeholder="Ex. Chiffrage réseau de gaines (CVC)")
-
-        st.divider()
-        type_ajout = st.radio("Ajouter :", ["Un ouvrage", "Un ensemble"], horizontal=True)
-        if type_ajout == "Un ouvrage":
-            rech = st.text_input("🔍 Filtrer les ouvrages", key="rech_devis")
-            options = [i for i in biblio.index
-                       if not rech or rech.lower() in str(biblio.loc[i, "designation"]).lower()]
-            if not options:
-                st.caption("Aucun ouvrage ne correspond.")
-            else:
-                c1, c2, c3 = st.columns([3, 1, 1])
-                choix = c1.selectbox("Ouvrage", options=options,
-                                     format_func=lambda i: f"{biblio.loc[i,'designation']} ({biblio.loc[i,'unite']})")
-                qte = c2.number_input("Quantité", min_value=0.0, value=1.0, step=1.0)
-                if c3.button("➕ Ajouter", use_container_width=True):
-                    o = biblio.loc[choix].to_dict()
-                    fourn = o.get("prix_fourniture") or 0
-                    mo = prix_mo(o.get("temps_mo"), o.get("nb_poseurs"),
-                                 o.get("taux_horaire") or taux_horaire)
-                    pu = fourn + mo
-                    st.session_state.devis_lignes.append(
-                        {"groupe": "", "designation": o["designation"], "unite": o["unite"],
-                         "quantite": qte, "prix_fourniture": fourn, "mo_unit": mo, "mo_active": True,
-                         "prix_unitaire": pu, "montant_ht": pu * qte})
-                    st.rerun()
-        else:
-            ens_all = charger_ensembles()
-            noms = sorted(ens_all["nom"].unique().tolist())
-            if not noms:
-                st.info("Aucun ensemble créé.")
-            else:
-                c1, c2, c3 = st.columns([3, 1, 1])
-                nom_ens = c1.selectbox("Ensemble", options=noms)
-                qte_ens = c2.number_input("Quantité", min_value=0.0, value=1.0, step=1.0)
-                if c3.button("➕ Ajouter l'ensemble", use_container_width=True):
-                    for _, c in ens_all[ens_all["nom"] == nom_ens].iterrows():
-                        match = biblio[biblio["designation"] == c["designation"]]
-                        if match.empty:
-                            continue
-                        o = match.iloc[0].to_dict()
-                        fourn = o.get("prix_fourniture") or 0
-                        mo = prix_mo(o.get("temps_mo"), o.get("nb_poseurs"),
-                                     o.get("taux_horaire") or taux_horaire)
-                        pu = fourn + mo
-                        q = (c["quantite"] or 0) * qte_ens
-                        st.session_state.devis_lignes.append(
-                            {"groupe": nom_ens, "designation": o["designation"], "unite": o["unite"],
-                             "quantite": q, "prix_fourniture": fourn, "mo_unit": mo, "mo_active": True,
-                             "prix_unitaire": pu, "montant_ht": pu * q})
-                    st.rerun()
-
-        if st.session_state.devis_lignes:
-            st.subheader("Lignes du devis (modifiables, supprimables)")
-            mo_generale = st.checkbox(
-                "Appliquer la main-d'œuvre sur ce devis", value=True,
-                help="Décoché = fourniture seule sur tout le devis (aucune MO comptée).")
-
-            cols_ordre = ["groupe", "designation", "unite", "quantite",
-                          "prix_fourniture", "mo_unit", "mo_active", "prix_unitaire", "montant_ht"]
-            dfl = pd.DataFrame(st.session_state.devis_lignes)
-            for c in cols_ordre:
-                if c not in dfl.columns:
-                    if c == "mo_active":
-                        dfl[c] = True
-                    elif c in ("prix_fourniture", "mo_unit"):
-                        dfl[c] = 0.0
-                    else:
-                        dfl[c] = None
-            dff = dfl[cols_ordre]
-
-            edited = st.data_editor(
-                dff, num_rows="dynamic", use_container_width=True,
-                column_config={
-                    "groupe": st.column_config.TextColumn("Ensemble", disabled=True),
-                    "designation": st.column_config.TextColumn("Désignation"),
-                    "unite": st.column_config.TextColumn("Unité"),
-                    "quantite": st.column_config.NumberColumn("Qté"),
-                    "prix_fourniture": st.column_config.NumberColumn("Fourniture (€)", format="%.2f"),
-                    "mo_unit": st.column_config.NumberColumn("MO unit. (€)", format="%.2f",
-                                                             help="Coût main-d'œuvre d'une unité de cette ligne."),
-                    "mo_active": st.column_config.CheckboxColumn("MO",
-                                                                 help="Coché = la main-d'œuvre est comptée sur cette ligne."),
-                    "prix_unitaire": st.column_config.NumberColumn("PU HT", format="%.2f", disabled=True),
-                    "montant_ht": st.column_config.NumberColumn("Montant HT", format="%.2f", disabled=True)},
-                key="editeur_devis")
-
-            edited = edited[edited["designation"].notna()].copy()
-            edited["quantite"] = edited["quantite"].fillna(0)
-            edited["prix_fourniture"] = edited["prix_fourniture"].fillna(0)
-            edited["mo_unit"] = edited["mo_unit"].fillna(0)
-            edited["mo_active"] = edited["mo_active"].fillna(True)
-            mo_appliquee = edited["mo_active"] & mo_generale
-            edited["prix_unitaire"] = edited["prix_fourniture"] + edited["mo_unit"].where(mo_appliquee, 0)
-            edited["montant_ht"] = edited["quantite"] * edited["prix_unitaire"]
-            st.session_state.devis_lignes = edited.to_dict("records")
-
-            cc1, cc2 = st.columns(2)
-            marge_pct = cc1.number_input("Marge (%)", min_value=0.0, value=0.0, step=1.0)
-            tva_pct = cc2.selectbox("TVA (%)", options=TVA_AUTORISEES,
-                                    index=TVA_AUTORISEES.index(mef_entreprise["tva_defaut"]),
-                                    format_func=lambda v: f"{v:g} %")
-
-            sous_total_ht = float(edited["montant_ht"].sum())
-            total_ht = sous_total_ht * (1 + marge_pct / 100)
-            montant_tva = total_ht * tva_pct / 100
-            total_ttc = total_ht + montant_tva
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Sous-total HT", f"{sous_total_ht:,.2f} €".replace(",", " "))
-            m2.metric("Total HT", f"{total_ht:,.2f} €".replace(",", " "))
-            m3.metric("Total TTC", f"{total_ttc:,.2f} €".replace(",", " "))
-
-            totaux = {"sous_total_ht": sous_total_ht, "marge_pct": marge_pct, "total_ht": total_ht,
-                      "tva_pct": tva_pct, "montant_tva": montant_tva, "total_ttc": total_ttc}
-            vj = str(ent.get("validite_jours") or "").strip()
-            validite = ((date_devis + timedelta(days=int(vj))).strftime("%d/%m/%Y")
-                        if vj.isdigit() else None)
-            infos = {"numero": st.session_state.numero_courant, "client": client_nom,
-                     "client_adresse": client_adresse, "client_tel": "",
-                     "date": date_devis.strftime("%d/%m/%Y"), "validite": validite,
-                     "validite_jours": ent.get("validite_jours"), "objet": objet,
-                     "date_debut": date_debut, "duree": duree}
-
-            with st.expander("🎨 Mise en forme de ce devis"):
-                mef_devis, surcharge_devis, options_devis = choix_mise_en_forme_devis(
-                    mef_entreprise, None, "mef_nouveau")
-                if st.toggle("Afficher l'aperçu", key="mef_nouveau_apercu"):
-                    afficher_apercu(ent, mef_devis, dict(infos, options=options_devis),
-                                    st.session_state.devis_lignes, totaux)
-            infos["options"] = options_devis
-
-            colA, colB, colC = st.columns(3)
-            if colA.button("💾 Enregistrer ce devis"):
-                record = {"numero": st.session_state.numero_courant, "date_devis": str(date_devis),
-                          "client_nom": client_nom, "client_adresse": client_adresse,
-                          "date_debut": date_debut, "duree": duree, "marge_pct": marge_pct,
-                          "tva_pct": tva_pct,
-                          "lignes_json": json.dumps(st.session_state.devis_lignes, ensure_ascii=False),
-                          "statut": "En attente"}
-                if sauvegarder_devis(record):
-                    ancien = st.session_state.numero_courant
-                    if surcharge_devis or options_devis.strip():
-                        enregistrer_mise_en_forme(ancien, surcharge_devis, options_devis)
-                    st.session_state.numero_courant = prochain_numero()
-                    st.success(f"Devis {ancien} enregistré. Prochain n° : {st.session_state.numero_courant}.")
-                else:
-                    st.error("Ce numéro existe déjà — enregistrement refusé (pas de doublon).")
-
-            pdf_bytes = generer_pdf_devis(ent, infos, st.session_state.devis_lignes, totaux,
-                                          mise_en_forme=mef_devis)
-            colB.download_button("📄 Télécharger le devis (PDF)", pdf_bytes,
-                                 f"{infos['numero']}.pdf", "application/pdf")
-
-            # Export Excel du devis mis en forme (une page) — le client le retravaille de son côté
-            xls_bytes = generer_excel_devis(ent, infos, st.session_state.devis_lignes, totaux)
-            colC.download_button("📊 Exporter ce devis (Excel)", xls_bytes,
-                                 f"{infos['numero']}.xlsx",
-                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            if st.button("🗑️ Vider le devis"):
-                st.session_state.devis_lignes = []
-                st.rerun()
-        else:
-            st.info("Aucune ligne. Ajoute un ouvrage ou un ensemble ci-dessus.")
-
     # ---- SUIVI ----
-    with t_suivi:
-        st.subheader("Suivi des devis")
+    def page_mes_devis():
+        st.header("📋 Mes devis")
         saved = charger_devis()
         if saved.empty:
             st.info("Aucun devis enregistré pour l'instant.")
@@ -2170,6 +2343,156 @@ def main():
                 f"En attente : {(saved['statut']=='En attente').sum()}  |  "
                 f"Acceptés : {(saved['statut']=='Accepté').sum()}  |  "
                 f"Refusés : {(saved['statut']=='Refusé').sum()}")
+
+
+    # ---- NOUVEAU DEVIS ----
+    def page_nouveau_devis():
+        st.header("🧾 Nouveau devis")
+        onglet_nouveau_devis(ent, mef_entreprise, taux_horaire)
+
+    # ---- MES PRIX (ouvrages + ensembles) ----
+    def page_mes_prix():
+        st.header("📚 Mes prix")
+        st.caption("Les ouvrages et leurs prix, réutilisés dans tous tes devis.")
+        t_ouvrages, t_ensembles = st.tabs(["Ouvrages", "Ensembles (lots tout prêts)"])
+        with t_ouvrages:
+            ecran_ouvrages()
+        with t_ensembles:
+            ecran_ensembles()
+
+    # ---- MON ENTREPRISE (identité, présentation des devis, tarif horaire) ----
+    def ecran_identite():
+        st.caption("Ces informations apparaissent en tête et en pied de chaque devis. "
+                   "Un champ laissé vide n'est simplement pas imprimé.")
+        g, d = st.columns(2, gap="large")
+        with g:
+            st.markdown("**Identité**")
+            if LOGO_PATH.exists():
+                st.image(str(LOGO_PATH), width=160, caption="Logo actuel")
+            logo_file = st.file_uploader("Logo (PNG / JPG)", type=["png", "jpg", "jpeg"], key="logo_up")
+            ent["raison_sociale"] = st.text_input("Raison sociale", ent["raison_sociale"])
+            ent["forme_juridique"] = st.text_input("Forme juridique", ent["forme_juridique"])
+            ent["capital"] = st.text_input("Capital social", ent["capital"], placeholder="Ex. 10 000 €")
+            ent["adresse"] = st.text_area("Adresse", ent["adresse"])
+            ent["telephone"] = st.text_input("Téléphone", ent["telephone"])
+            ent["email"] = st.text_input("Email", ent["email"])
+            ent["site_web"] = st.text_input("Site web", ent["site_web"])
+            ent["siret"] = st.text_input("SIRET", ent["siret"])
+            ent["tva_intra"] = st.text_input("N° TVA intracommunautaire", ent["tva_intra"])
+            ent["code_ape"] = st.text_input("Code APE / NAF", ent["code_ape"], placeholder="Ex. 4322B")
+        with d:
+            st.markdown("**Assurances et qualifications**")
+            ent["assurance_nom"] = st.text_input("Assureur décennale", ent["assurance_nom"])
+            ent["assurance_police"] = st.text_input("N° police décennale", ent["assurance_police"])
+            ent["assurance_couverture"] = st.text_input("Couverture géographique", ent["assurance_couverture"])
+            ent["rc_pro_nom"] = st.text_input("Assureur RC pro", ent["rc_pro_nom"])
+            ent["rc_pro_police"] = st.text_input("N° police RC pro", ent["rc_pro_police"])
+            ent["qualifications"] = st.text_input("Qualifications", ent["qualifications"],
+                                                  placeholder="Ex. RGE QualiPAC, Qualibat 5211")
+            st.markdown("**Conditions du devis**")
+            ent["conditions_reglement"] = st.text_area("Conditions de règlement", ent["conditions_reglement"])
+            ent["validite_jours"] = st.text_input("Validité du devis (jours)", ent["validite_jours"] or "30")
+            ent["acompte_pct"] = st.text_input("Acompte demandé à la commande (%)", ent["acompte_pct"],
+                                               placeholder="Vide = pas d'acompte")
+            ent["mention_devis"] = st.text_input("Mention en pied de devis",
+                                                 ent["mention_devis"] or MENTION_DEVIS_DEFAUT)
+        if st.button("💾 Enregistrer mon entreprise", type="primary"):
+            enregistrer_entreprise(ent)
+            if logo_file is not None:
+                LOGO_PATH.write_bytes(logo_file.getvalue())
+            st.session_state["flash"] = "Fiche entreprise enregistrée."
+            st.rerun()
+
+    def ecran_tarif_horaire():
+        st.caption("Sert à calculer la main-d'œuvre : temps de pose × nombre de poseurs × tarif horaire. "
+                   "Un ouvrage peut avoir son propre tarif dans « Mes prix ».")
+        nouveau = st.number_input("Tarif horaire par défaut (€/h)", min_value=0.0, value=taux_horaire,
+                                  step=1.0, key="ent_taux_horaire")
+        if st.button("💾 Enregistrer le tarif horaire", type="primary"):
+            fichier = charger_entreprise()
+            fichier["taux_horaire"] = nouveau
+            enregistrer_entreprise(fichier)
+            st.session_state["flash"] = "Tarif horaire enregistré."
+            st.rerun()
+
+    def page_entreprise():
+        st.header("🏢 Mon entreprise")
+        t_identite, t_presentation, t_tarif = st.tabs(
+            ["Identité et mentions", "Présentation des devis", "Tarif horaire"])
+        with t_identite:
+            ecran_identite()
+        with t_presentation:
+            ecran_presentation()
+        with t_tarif:
+            ecran_tarif_horaire()
+
+    # ---- COMPTES ----
+    def page_comptes():
+        st.header("🔑 Comptes utilisateurs" if est_admin else "🔑 Mon mot de passe")
+        panneau_comptes(st)
+
+    # ---- ACCUEIL ----
+    def page_accueil():
+        st.header(f"🏠 {_texte(ent.get('raison_sociale')) or 'Bienvenue'}")
+        if not _texte(ent.get("raison_sociale")):
+            st.info("Première utilisation ? Commence par ta fiche entreprise : "
+                    "elle apparaît en tête de chaque devis.")
+            if st.button("🏢 Remplir Mon entreprise"):
+                st.switch_page(p_entreprise)
+
+        en_cours = len(st.session_state.devis_lignes) if not st.session_state.get("nd_enregistre") else 0
+        r1, r2, r3 = st.columns(3)
+        libelle = f"🧾 Continuer mon devis ({en_cours} ligne(s))" if en_cours else "🧾 Nouveau devis"
+        if r1.button(libelle, type="primary", use_container_width=True):
+            st.switch_page(p_nouveau)
+        if r2.button("📋 Reprendre un devis", use_container_width=True):
+            st.switch_page(p_devis)
+        if r3.button("📚 Mes prix", use_container_width=True):
+            st.switch_page(p_prix)
+
+        devis = charger_devis()
+        if devis.empty:
+            st.caption("Aucun devis pour l'instant : clique sur « Nouveau devis » pour faire le premier.")
+            return
+        devis = devis.merge(charger_complements(), on="numero", how="left")
+        devis["total_ttc"] = devis.apply(total_devis_ttc, axis=1)
+        attente = devis[devis["statut"] == "En attente"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Devis en attente de réponse", len(attente))
+        m2.metric("Montant en attente (TTC)", _eur(attente["total_ttc"].sum()))
+        m3.metric("Devis acceptés", int((devis["statut"] == "Accepté").sum()))
+
+        st.subheader("Mes derniers devis")
+        for _, r in devis.iloc[::-1].head(5).iterrows():
+            c = st.columns([2, 3, 2, 2, 2, 1.5], vertical_alignment="center")
+            c[0].markdown(f"**{r['numero']}**")
+            c[1].write(_texte(r["client_nom"]) or "—")
+            c[2].write(_texte(r["date_devis"]))
+            c[3].write(_eur(r["total_ttc"]))
+            c[4].write(_texte(r["statut"]))
+            if c[5].button("Ouvrir", key=f"acc_ouvrir_{r['numero']}", use_container_width=True):
+                st.session_state["suivi_pdf_sel"] = r["numero"]
+                st.switch_page(p_devis)
+
+    # ---- MENU ----
+    p_accueil = st.Page(page_accueil, title="Accueil", icon="🏠", url_path="accueil", default=True)
+    p_nouveau = st.Page(page_nouveau_devis, title="Nouveau devis", icon="🧾", url_path="nouveau-devis")
+    p_devis = st.Page(page_mes_devis, title="Mes devis", icon="📋", url_path="mes-devis")
+    p_clients = st.Page(page_clients, title="Mes clients", icon="👥", url_path="mes-clients")
+    p_prix = st.Page(page_mes_prix, title="Mes prix", icon="📚", url_path="mes-prix")
+    p_entreprise = st.Page(page_entreprise, title="Mon entreprise", icon="🏢", url_path="mon-entreprise")
+    p_comptes = st.Page(page_comptes, icon="🔑", url_path="comptes",
+                        title="Comptes utilisateurs" if est_admin else "Mon mot de passe")
+    page = st.navigation({"": [p_accueil],
+                          "Devis": [p_nouveau, p_devis],
+                          "Carnet": [p_clients, p_prix],
+                          "Réglages": [p_entreprise, p_comptes]})
+    with st.sidebar:
+        st.caption(f"Connecté : {st.session_state.get('user', '')}")
+        if st.button("Se déconnecter", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+    page.run()
 
 
 if __name__ == "__main__":
