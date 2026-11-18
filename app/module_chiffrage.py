@@ -28,6 +28,15 @@ DEVIS_COLS = ["numero", "date_devis", "client_nom", "client_adresse", "date_debu
               "duree", "marge_pct", "tva_pct", "lignes_json", "statut"]
 STATUTS = ["En attente", "Accepté", "Refusé"]
 TVA_AUTORISEES = [0.0, 5.5, 10.0, 20.0]
+# Factures : snapshot figé d'un devis (lignes/totaux copiés à la création,
+# ils ne bougent plus si le devis change ensuite).
+FACTURE_COLS = ["numero", "numero_devis", "date_facture", "client_nom", "client_adresse",
+                "lignes_json", "marge_pct", "tva_pct", "remise_type", "remise_valeur",
+                "type_facture", "acompte_pct", "acompte_verse", "mentions", "mise_en_forme",
+                "statut_paiement", "date_paiement", "date_modif"]
+STATUTS_PAIEMENT = ["À payer", "Payée"]
+TYPES_FACTURE = {"totale": "Facture totale", "acompte": "Facture d'acompte",
+                 "solde": "Facture de solde"}
 # Table annexe (remise, mentions, date de modif) : la table `devis` reste inchangée.
 COMPLEMENT_COLS = ["numero", "remise_type", "remise_valeur", "mentions", "date_modif",
                    "mise_en_forme", "options_variantes"]
@@ -43,6 +52,8 @@ ENTREPRISE_CHAMPS = [
     "rc_pro_nom", "rc_pro_police", "qualifications",
     # mentions du devis (la mise en forme vit sous la clé « mise_en_forme »)
     "acompte_pct", "mention_devis",
+    # facturation (coordonnées bancaires : sur la facture, jamais sur le devis)
+    "iban", "bic", "penalites_retard", "mention_facture",
 ]
 
 
@@ -78,6 +89,14 @@ def init_db():
             numero TEXT PRIMARY KEY, remise_type TEXT, remise_valeur DOUBLE PRECISION,
             mentions TEXT, date_modif TEXT)"""))
         con.execute(text("CREATE TABLE IF NOT EXISTS favoris (designation TEXT PRIMARY KEY)"))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS factures (
+            numero TEXT PRIMARY KEY, numero_devis TEXT, date_facture TEXT,
+            client_nom TEXT, client_adresse TEXT, lignes_json TEXT,
+            marge_pct DOUBLE PRECISION, tva_pct DOUBLE PRECISION,
+            remise_type TEXT, remise_valeur DOUBLE PRECISION,
+            type_facture TEXT, acompte_pct DOUBLE PRECISION, acompte_verse DOUBLE PRECISION,
+            mentions TEXT, mise_en_forme TEXT,
+            statut_paiement TEXT, date_paiement TEXT, date_modif TEXT)"""))
     # migration douce : colonnes ajoutées après coup (jamais supprimées)
     _ajouter_colonnes("devis_complements", {"mise_en_forme": "TEXT", "options_variantes": "TEXT"})
     init_utilisateurs()
@@ -257,6 +276,103 @@ def prochain_numero() -> str:
     nums = [int(n[len(prefixe):]) for n in df["numero"]
             if isinstance(n, str) and n.startswith(prefixe) and n[len(prefixe):].isdigit()]
     return f"{prefixe}{(max(nums) + 1) if nums else 1:03d}"
+
+
+# ----------------------------------------------------------------------------
+# FACTURES  (snapshot d'un devis ; écriture ciblée, pas de réécriture globale)
+# ----------------------------------------------------------------------------
+def charger_factures():
+    return _lire("factures", FACTURE_COLS)
+
+
+def prochain_numero_facture() -> str:
+    """Numérotation continue et sans trou : max + 1. Les factures ne sont jamais
+    supprimées, donc la suite ne saute aucun numéro (obligation légale)."""
+    prefixe = f"FAC-{date.today().year}-"
+    df = charger_factures()
+    nums = [int(n[len(prefixe):]) for n in df["numero"]
+            if isinstance(n, str) and n.startswith(prefixe) and n[len(prefixe):].isdigit()]
+    return f"{prefixe}{(max(nums) + 1) if nums else 1:03d}"
+
+
+def sauvegarder_facture(record) -> bool:
+    champs = {c: record.get(c) for c in FACTURE_COLS}
+    cols = ", ".join(FACTURE_COLS)
+    params = ", ".join(f":{c}" for c in FACTURE_COLS)
+    try:
+        with get_engine().begin() as con:
+            con.execute(text(f"INSERT INTO factures ({cols}) VALUES ({params})"), champs)
+    except Exception:
+        return False  # numéro déjà pris : l'appelant réessaie avec le suivant
+    return True
+
+
+def mettre_a_jour_facture(numero: str, champs: dict) -> bool:
+    champs = {c: v for c, v in champs.items() if c in FACTURE_COLS and c != "numero"}
+    if not champs:
+        return False
+    set_clause = ", ".join(f"{c} = :{c}" for c in champs)
+    with get_engine().begin() as con:
+        res = con.execute(text(f"UPDATE factures SET {set_clause} WHERE numero = :numero"),
+                          {**champs, "numero": numero})
+    return res.rowcount > 0
+
+
+def factures_du_devis(numero_devis: str):
+    df = charger_factures()
+    return df[df["numero_devis"] == numero_devis] if not df.empty else df
+
+
+def montants_facture(rec) -> dict:
+    """Totaux de la facture (figés) : HT, TVA, TTC, puis net à payer selon le type
+    (totale, acompte au %, solde = TTC moins acompte déjà facturé)."""
+    try:
+        lignes = json.loads(rec["lignes_json"]) if not _vide(rec.get("lignes_json")) else []
+    except (ValueError, TypeError):
+        lignes = []
+    t = calculer_totaux(lignes, rec.get("marge_pct"), rec.get("tva_pct"),
+                        rec.get("remise_type"), rec.get("remise_valeur"))
+    t["type_facture"] = rec.get("type_facture") or "totale"
+    t["acompte_pct"] = _num(rec.get("acompte_pct"))
+    t["acompte_verse"] = _num(rec.get("acompte_verse"))
+    t["lignes"] = lignes
+    if t["type_facture"] == "acompte":
+        t["net_a_payer"] = t["total_ttc"] * t["acompte_pct"] / 100
+    elif t["type_facture"] == "solde":
+        t["net_a_payer"] = t["total_ttc"] - t["acompte_verse"]
+    else:
+        t["net_a_payer"] = t["total_ttc"]
+    return t
+
+
+def acompte_deja_facture(numero_devis: str) -> float:
+    """Somme des factures d'acompte déjà émises pour ce devis (pour le solde)."""
+    df = factures_du_devis(numero_devis)
+    return sum(montants_facture(r)["net_a_payer"]
+               for _, r in df.iterrows() if (r.get("type_facture") or "") == "acompte")
+
+
+def creer_facture(rec_devis, type_facture: str, acompte_pct: float) -> tuple:
+    """Crée une facture (snapshot du devis) et renvoie (ok, numero). Reprend les
+    lignes, totaux, remise et mise en forme du devis d'origine."""
+    comp = complement_devis(_texte(rec_devis.get("numero")))
+    verse = acompte_deja_facture(_texte(rec_devis.get("numero"))) if type_facture == "solde" else 0.0
+    record = {"numero": prochain_numero_facture(), "numero_devis": _texte(rec_devis.get("numero")),
+              "date_facture": str(date.today()), "client_nom": _texte(rec_devis.get("client_nom")),
+              "client_adresse": _texte(rec_devis.get("client_adresse")),
+              "lignes_json": rec_devis.get("lignes_json") or "[]",
+              "marge_pct": _num(rec_devis.get("marge_pct")), "tva_pct": _num(rec_devis.get("tva_pct"), 20.0),
+              "remise_type": comp["remise_type"], "remise_valeur": comp["remise_valeur"],
+              "type_facture": type_facture, "acompte_pct": _num(acompte_pct), "acompte_verse": verse,
+              "mentions": "", "mise_en_forme": (json.dumps(comp["mise_en_forme"], ensure_ascii=False)
+                                                if comp["mise_en_forme"] else None),
+              "statut_paiement": "À payer", "date_paiement": "",
+              "date_modif": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    for _ in range(3):   # numéro pris entre-temps : on prend le suivant
+        if sauvegarder_facture(record):
+            return True, record["numero"]
+        record["numero"] = prochain_numero_facture()
+    return False, record["numero"]
 
 
 def charger_entreprise():
@@ -655,9 +771,11 @@ class _PDFDevis(FPDF):
     """FPDF + réglages de mise en forme ; en-tête allégé (pages 2 et suivantes),
     bandeau éventuel et pied répétés automatiquement à chaque saut de page."""
 
-    def __init__(self, ent, infos, mef):
+    def __init__(self, ent, infos, mef, document="devis"):
         super().__init__(format="A4")
         self.ent, self.infos, self.mef = ent, infos, mef
+        self.document = document            # "devis" ou "facture"
+        self.titre = "FACTURE" if document == "facture" else "DEVIS"
         self.style = STYLES[mef["modele"]]
         self.accent = _rgb(mef["couleur_accent"])
         self.set_margins(15, 12, 15)
@@ -692,7 +810,7 @@ class _PDFDevis(FPDF):
         self.cell(105, 6, _tronquer(self, raison, 103))
         self.police("B", 9)
         self.set_text_color(*self.accent)
-        rappel = _joindre(f"DEVIS n° {self.infos.get('numero')}", self.infos.get("date"), sep=" du ")
+        rappel = _joindre(f"{self.titre} n° {self.infos.get('numero')}", self.infos.get("date"), sep=" du ")
         self.cell(75, 6, _tronquer(self, _txt(rappel), 74), align="R")
         self.set_text_color(0, 0, 0)
         self.filet(15.5)
@@ -767,12 +885,16 @@ def _cartouche(pdf, infos, ent, x, largeur) -> float:
         pdf.set_text_color(255, 255, 255)
     else:
         pdf.set_text_color(0, 0, 0)
-    pdf.cell(largeur - 2, h_titre, "DEVIS")
+    pdf.cell(largeur - 2, h_titre, pdf.titre)
     if not st_["fond_cartouche"]:
         pdf.filet(haut + h_titre, pdf.accent, 0.5, x=x, largeur=largeur)
-    lignes = [("N°", infos.get("numero")), ("Date d'émission", infos.get("date"))]
-    if pdf.mef["section_validite"]:
-        lignes.append(("Validité", _validite(infos, ent)))
+    if pdf.document == "facture":
+        lignes = [("N°", infos.get("numero")), ("Date", infos.get("date")),
+                  ("Réf. devis", infos.get("reference")), ("Échéance", infos.get("echeance"))]
+    else:
+        lignes = [("N°", infos.get("numero")), ("Date d'émission", infos.get("date"))]
+        if pdf.mef["section_validite"]:
+            lignes.append(("Validité", _validite(infos, ent)))
     y = haut + h_titre + 2
     for libelle, valeur in lignes:
         if not valeur:
@@ -977,26 +1099,47 @@ def _options_variantes(pdf, infos):
         _bloc_texte(pdf, pdf.l_margin + 3, LARGEUR_UTILE - 3, f"- {option}", 8.5, interligne=4.2)
 
 
+def _assurances_qualifs(e) -> list:
+    """Lignes assurance décennale / RC pro / qualifications (vides omises)."""
+    decennale = ""
+    if e.get("assurance_nom") or e.get("assurance_police"):
+        decennale = _joindre(e.get("assurance_nom"),
+                             f"police n° {e['assurance_police']}" if e.get("assurance_police") else "",
+                             f"couverture : {e['assurance_couverture']}" if e.get("assurance_couverture") else "")
+    rc_pro = _joindre(e.get("rc_pro_nom"),
+                      f"police n° {e['rc_pro_police']}" if e.get("rc_pro_police") else "")
+    return [m for m in (
+        f"Assurance décennale : {decennale}" if decennale else "",
+        f"Responsabilité civile professionnelle : {rc_pro}" if rc_pro else "",
+        f"Qualifications : {e['qualifications']}" if e.get("qualifications") else "",
+    ) if m]
+
+
+def _mentions_facture(pdf) -> list:
+    """Pied de la facture : règlement, coordonnées bancaires, pénalités, assurances."""
+    e = pdf.ent
+    banque = _joindre(f"IBAN {e['iban']}" if e.get("iban") else "",
+                      f"BIC {e['bic']}" if e.get("bic") else "")
+    return [m for m in (
+        f"Conditions de règlement : {e['conditions_reglement']}" if e.get("conditions_reglement") else "",
+        f"Règlement par virement — {banque}" if banque else "",
+        f"Pénalités de retard : {e['penalites_retard']}" if e.get("penalites_retard") else "",
+        *_assurances_qualifs(e),
+        e.get("mention_facture") or "",
+    ) if m]
+
+
 def _mentions_legales(pdf) -> list:
     """Pied du devis selon les sections activées ; champs vides omis."""
+    if pdf.document == "facture":
+        return _mentions_facture(pdf)
     e, mef = pdf.ent, pdf.mef
     mentions = []
     if mef["section_paiement"] and e.get("conditions_reglement"):
         mentions.append(f"Conditions de règlement : {e['conditions_reglement']}")
     if mef["section_mentions"]:
-        decennale = ""
-        if e.get("assurance_nom") or e.get("assurance_police"):
-            decennale = _joindre(e.get("assurance_nom"),
-                                 f"police n° {e['assurance_police']}" if e.get("assurance_police") else "",
-                                 f"couverture : {e['assurance_couverture']}" if e.get("assurance_couverture") else "")
-        rc_pro = _joindre(e.get("rc_pro_nom"),
-                          f"police n° {e['rc_pro_police']}" if e.get("rc_pro_police") else "")
-        mentions += [m for m in (
-            f"Assurance décennale : {decennale}" if decennale else "",
-            f"Responsabilité civile professionnelle : {rc_pro}" if rc_pro else "",
-            f"Qualifications : {e['qualifications']}" if e.get("qualifications") else "",
-            e.get("mention_devis") or MENTION_DEVIS_DEFAUT,
-        ) if m]
+        mentions += _assurances_qualifs(e)
+        mentions.append(e.get("mention_devis") or MENTION_DEVIS_DEFAUT)
     return mentions
 
 
@@ -1051,15 +1194,30 @@ def _bloc_final(pdf, infos, totaux):
         lignes_tot.append((lib, -remise, ""))
     lignes_tot.append(("Total HT", t["total_ht"], "B"))
     lignes_tot.append((f"TVA {_num(t.get('tva_pct')):g} %", t["montant_tva"], ""))
-    pct = _num(ent.get("acompte_pct")) if mef["section_paiement"] else 0.0
-    acompte = t["total_ttc"] * pct / 100 if 0 < pct <= 100 else 0.0
+
+    if pdf.document == "facture":
+        lignes_tot.append(("Total TTC", t["total_ttc"], "B"))
+        type_f = infos.get("type_facture") or "totale"
+        verse = _num(infos.get("acompte_verse"))
+        if type_f == "solde" and verse:
+            lignes_tot.append(("Acompte déjà facturé", -verse, ""))
+        boite_label = (f"ACOMPTE À PAYER ({_num(infos.get('acompte_pct')):g} %)"
+                       if type_f == "acompte" else "NET À PAYER")
+        boite_montant = _num(infos.get("net_a_payer"), t["total_ttc"])
+        note, acompte = infos.get("echeance") and f"À régler avant le {infos['echeance']}", 0.0
+        section_accord = False
+    else:
+        boite_label, boite_montant, note = "TOTAL TTC", t["total_ttc"], ""
+        pct = _num(ent.get("acompte_pct")) if mef["section_paiement"] else 0.0
+        acompte = t["total_ttc"] * pct / 100 if 0 < pct <= 100 else 0.0
+        section_accord = mef["section_accord"]
     remarques = infos.get("mentions")
     legales = _mentions_legales(pdf)
 
     # tout le bloc doit tenir sur la page, sinon on passe à la suivante
-    h_tot = H_LIGNE_TOTAL * len(lignes_tot) + 10.5 + (6.5 if acompte else 0)
+    h_tot = H_LIGNE_TOTAL * len(lignes_tot) + 10.5 + (6.5 if (acompte or note) else 0)
     h_rem = 5 + 4 * _nb_lignes(pdf, remarques, 88, 8.5) if remarques else 0
-    h_gauche = (h_rem + 3 if remarques else 0) + (H_ACCORD if mef["section_accord"] else 0)
+    h_gauche = (h_rem + 3 if remarques else 0) + (H_ACCORD if section_accord else 0)
     h_leg = 5 + 3.4 * sum(_nb_lignes(pdf, m, LARGEUR_UTILE, 7) for m in legales) if legales else 0
     if pdf.will_page_break(4 + max(h_tot, h_gauche) + 5 + h_leg):
         pdf.add_page()
@@ -1083,8 +1241,8 @@ def _bloc_final(pdf, infos, totaux):
     else:
         pdf.filet(y, pdf.accent, 0.5, x=x_tot, largeur=l_tot)
         pdf.filet(y + 9, pdf.accent, 0.5, x=x_tot, largeur=l_tot)
-    pdf.cell(l_tot - l_val, 9, "TOTAL TTC", align="R")
-    pdf.cell(l_val, 9, pdf.euro(t["total_ttc"]), align="R")
+    pdf.cell(l_tot - l_val, 9, boite_label, align="R")
+    pdf.cell(l_val, 9, pdf.euro(boite_montant), align="R")
     pdf.set_text_color(0, 0, 0)
     y += 9
     if acompte:
@@ -1094,6 +1252,13 @@ def _bloc_final(pdf, infos, totaux):
         pdf.police("B", 9)
         pdf.cell(l_val, 5.5, pdf.euro(acompte), align="R")
         y += 6.5
+    elif note:
+        pdf.set_xy(x_tot, y + 1)
+        pdf.police("I", 8.5)
+        pdf.set_text_color(*GRIS_TEXTE)
+        pdf.cell(l_tot, 5.5, _txt(note), align="R")
+        pdf.set_text_color(0, 0, 0)
+        y += 6.5
     bas_droite, y_gauche = y, haut
     if remarques:
         pdf.set_xy(x, haut)
@@ -1101,38 +1266,70 @@ def _bloc_final(pdf, infos, totaux):
         pdf.cell(88, 5, "Remarques", new_x="LMARGIN", new_y="NEXT")
         _bloc_texte(pdf, x, 88, remarques, 8.5, interligne=4)
         y_gauche = pdf.get_y() + 3
-    bas_gauche = _bon_pour_accord(pdf, x, y_gauche) if mef["section_accord"] else y_gauche
+    bas_gauche = _bon_pour_accord(pdf, x, y_gauche) if section_accord else y_gauche
 
     if legales:
         pdf.set_y(max(bas_droite, bas_gauche) + 5)
         pdf.set_x(x)
         pdf.police("B", 7.5)
         pdf.set_text_color(*GRIS_TEXTE)
-        titre = "Informations légales" if mef["section_mentions"] else "Conditions de paiement"
+        if pdf.document == "facture":
+            titre = "Informations de facturation"
+        else:
+            titre = "Informations légales" if mef["section_mentions"] else "Conditions de paiement"
         pdf.cell(LARGEUR_UTILE, 4.5, titre, new_x="LMARGIN", new_y="NEXT")
         for mention in legales:
             _bloc_texte(pdf, x, LARGEUR_UTILE, mention, 7, couleur=GRIS_TEXTE, interligne=3.4)
 
 
-def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None):
-    """Devis PDF. Un seul moteur : le modèle (classique / moderne / compact),
-    la couleur, le logo et les sections viennent de `mise_en_forme` (complété
-    par les préférences de l'entreprise puis les défauts). Les montants
-    viennent de `totaux` (calculer_totaux) ; seul le sous-total de section est
-    sommé ici. Les coordonnées bancaires ne figurent jamais sur le devis.
-    `infos["options"]` : options / variantes non chiffrées, une par ligne."""
+def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None, document="devis"):
+    """Devis OU facture (`document` = "devis" | "facture"), même moteur. Le modèle,
+    la couleur, le logo et les sections viennent de `mise_en_forme` (complété par
+    les préférences de l'entreprise puis les défauts). Les montants viennent de
+    `totaux` (calculer_totaux). Les coordonnées bancaires ne figurent que sur la
+    facture, jamais sur le devis. `infos["options"]` : options non chiffrées (devis).
+    Pour une facture, `infos` porte : reference, echeance, type_facture, acompte_pct,
+    acompte_verse, net_a_payer."""
     ent = {k: _texte(v) for k, v in (entreprise or {}).items() if not isinstance(v, dict)}
     mef = normaliser_mise_en_forme(mise_en_forme_entreprise(entreprise or {}), mise_en_forme)
     infos = {k: _texte(v) for k, v in (infos or {}).items()}
-    pdf = _PDFDevis(ent, infos, mef)
+    pdf = _PDFDevis(ent, infos, mef, document=document)
     pdf.add_page()
     _entete_page1(pdf, ent, infos)
     _objet_chantier(pdf, infos)
     pdf.ln(2)
     _tableau_lignes(pdf, lignes or [])
-    _options_variantes(pdf, infos)
+    if document == "devis":
+        _options_variantes(pdf, infos)
     _bloc_final(pdf, infos, totaux)
     return bytes(pdf.output())
+
+
+def _date_fr(valeur) -> str:
+    try:
+        return date.fromisoformat(_texte(valeur)).strftime("%d/%m/%Y")
+    except ValueError:
+        return _texte(valeur)
+
+
+def generer_pdf_facture(entreprise, rec, delai_paiement=30):
+    """PDF d'une facture à partir de sa ligne en base (snapshot figé).
+    Réutilise generer_pdf_devis en mode « facture »."""
+    t = montants_facture(rec)
+    try:
+        echeance = (date.fromisoformat(_texte(rec.get("date_facture")))
+                    + timedelta(days=delai_paiement)).strftime("%d/%m/%Y")
+    except ValueError:
+        echeance = ""
+    infos = {"numero": rec.get("numero"), "date": _date_fr(rec.get("date_facture")),
+             "reference": _texte(rec.get("numero_devis")), "echeance": echeance,
+             "client": rec.get("client_nom"), "client_adresse": rec.get("client_adresse"),
+             "client_tel": "", "mentions": _texte(rec.get("mentions")),
+             "type_facture": t["type_facture"], "acompte_pct": t["acompte_pct"],
+             "acompte_verse": t["acompte_verse"], "net_a_payer": t["net_a_payer"]}
+    return generer_pdf_devis(entreprise or charger_entreprise(), infos, t["lignes"], t,
+                             mise_en_forme=surcharge_mise_en_forme(rec.get("mise_en_forme")),
+                             document="facture")
 
 
 # -----------------------------------------------------------------------------
@@ -2339,11 +2536,117 @@ def main():
                 st.session_state.pop("ed_etat", None)  # repart toujours de la version en base
                 dialog_modifier_devis(sel_pdf, taux_horaire)
 
+            st.divider()
+            st.markdown("**Facturer ce devis**")
+            fac_existantes = factures_du_devis(sel_pdf)
+            if _texte(rec.get("statut")) != "Accepté":
+                st.caption("Passe le devis au statut « Accepté » (ci-dessus) pour pouvoir le facturer.")
+            else:
+                a_acompte = not fac_existantes.empty and \
+                    (fac_existantes["type_facture"] == "acompte").any()
+                types = {"totale": "Facture totale", "acompte": "Facture d'acompte"}
+                if a_acompte:
+                    types["solde"] = "Facture de solde (déduit l'acompte)"
+                fc = st.columns([2, 1, 1], vertical_alignment="bottom")
+                type_f = fc[0].selectbox("Type de facture", list(types), format_func=types.get,
+                                         key="fac_type")
+                pct = fc[1].number_input("Acompte (%)", min_value=0.0, max_value=100.0, step=5.0,
+                                         value=_num(ent.get("acompte_pct")) or 30.0,
+                                         key="fac_pct", disabled=type_f != "acompte")
+                if fc[2].button("🧾 Créer la facture", type="primary", use_container_width=True):
+                    ok, num = creer_facture(rec, type_f, pct)
+                    if ok:
+                        st.session_state["flash"] = f"Facture {num} créée (voir « Mes factures »)."
+                        st.rerun()
+                    else:
+                        st.error("Création impossible, réessaie.")
+            if not fac_existantes.empty:
+                st.caption("Factures déjà émises pour ce devis : "
+                           + ", ".join(fac_existantes["numero"].tolist()))
+
             st.caption(
                 f"En attente : {(saved['statut']=='En attente').sum()}  |  "
                 f"Acceptés : {(saved['statut']=='Accepté').sum()}  |  "
                 f"Refusés : {(saved['statut']=='Refusé').sum()}")
 
+
+    # ---- MES FACTURES ----
+    def page_mes_factures():
+        st.header("🧾 Mes factures")
+        fac = charger_factures()
+        if fac.empty:
+            st.info("Aucune facture pour l'instant. Crée-la depuis un devis accepté "
+                    "(📋 Mes devis → Facturer ce devis).")
+            return
+        fac = fac.sort_values("numero").reset_index(drop=True)
+        nets = {r["numero"]: montants_facture(r)["net_a_payer"] for _, r in fac.iterrows()}
+        vue = pd.DataFrame({
+            "numero": fac["numero"],
+            "numero_devis": [_texte(v) for v in fac["numero_devis"]],
+            "date_facture": [_date_fr(v) for v in fac["date_facture"]],
+            "client_nom": [_texte(v) for v in fac["client_nom"]],
+            "type": [TYPES_FACTURE.get(_texte(t) or "totale", t) for t in fac["type_facture"]],
+            "net": [round(nets[n], 2) for n in fac["numero"]],
+            "statut_paiement": [(_texte(v) or "À payer") for v in fac["statut_paiement"]],
+        })
+        edited = st.data_editor(
+            vue, hide_index=True, use_container_width=True, key="editeur_factures",
+            column_config={
+                "numero": st.column_config.TextColumn("N° facture", disabled=True),
+                "numero_devis": st.column_config.TextColumn("Devis", disabled=True),
+                "date_facture": st.column_config.TextColumn("Date", disabled=True),
+                "client_nom": st.column_config.TextColumn("Client", disabled=True),
+                "type": st.column_config.TextColumn("Type", disabled=True),
+                "net": st.column_config.NumberColumn("Net à payer (€)", format="%.2f", disabled=True),
+                "statut_paiement": st.column_config.SelectboxColumn("Paiement", options=STATUTS_PAIEMENT)})
+        if st.button("💾 Enregistrer les paiements"):
+            actuel = dict(zip(fac["numero"], [(_texte(v) or "À payer") for v in fac["statut_paiement"]]))
+            for _, row in edited.iterrows():
+                if row["statut_paiement"] != actuel.get(row["numero"]):
+                    mettre_a_jour_facture(row["numero"], {
+                        "statut_paiement": row["statut_paiement"],
+                        "date_paiement": str(date.today()) if row["statut_paiement"] == "Payée" else "",
+                        "date_modif": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            st.session_state["flash"] = "Paiements mis à jour."
+            st.rerun()
+        impaye = sum(nets[r["numero"]] for _, r in fac.iterrows()
+                     if (_texte(r.get("statut_paiement")) or "À payer") == "À payer")
+        st.caption(f"Reste à encaisser : **{_eur(impaye)}**")
+
+        st.divider()
+        st.markdown("**Télécharger ou modifier une facture**")
+        libelles = {r["numero"]: f"{r['numero']} — {_texte(r['client_nom'])} — {_date_fr(r['date_facture'])}"
+                    for _, r in fac.iterrows()}
+        sel = st.selectbox("Facture", fac["numero"].tolist()[::-1],
+                           format_func=lambda n: libelles.get(n, n), key="fac_sel")
+        rec = fac[fac["numero"] == sel].iloc[0]
+        st.download_button("📄 Télécharger cette facture (PDF)", generer_pdf_facture(ent, rec),
+                           f"{sel}.pdf", "application/pdf", key="fac_dl")
+        with st.expander("✏️ Modifier cette facture (date, remarques, paiement)"):
+            st.caption("Les lignes et montants d'une facture émise ne se modifient pas : "
+                       "pour corriger un chiffrage, repars du devis.")
+            cc = st.columns(2)
+            try:
+                d0 = date.fromisoformat(_texte(rec.get("date_facture")))
+            except ValueError:
+                d0 = date.today()
+            new_date = cc[0].date_input("Date de la facture", value=d0, format="DD/MM/YYYY", key="fac_date")
+            statut_p = cc[1].selectbox(
+                "Paiement", STATUTS_PAIEMENT,
+                index=STATUTS_PAIEMENT.index(_texte(rec.get("statut_paiement")) or "À payer"),
+                key="fac_statut")
+            new_ment = st.text_area("Remarques imprimées sur la facture",
+                                    value=_texte(rec.get("mentions")), key="fac_ment")
+            if st.button("💾 Enregistrer la facture", key="fac_save"):
+                deja = _texte(rec.get("date_paiement"))
+                mettre_a_jour_facture(sel, {
+                    "date_facture": str(new_date), "mentions": new_ment.strip(),
+                    "statut_paiement": statut_p,
+                    "date_paiement": (str(date.today()) if statut_p == "Payée" and not deja
+                                      else (deja if statut_p == "Payée" else "")),
+                    "date_modif": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                st.session_state["flash"] = f"Facture {sel} mise à jour."
+                st.rerun()
 
     # ---- NOUVEAU DEVIS ----
     def page_nouveau_devis():
@@ -2396,6 +2699,15 @@ def main():
                                                placeholder="Vide = pas d'acompte")
             ent["mention_devis"] = st.text_input("Mention en pied de devis",
                                                  ent["mention_devis"] or MENTION_DEVIS_DEFAUT)
+            st.markdown("**Facturation**")
+            st.caption("Coordonnées bancaires : imprimées sur la facture, jamais sur le devis.")
+            ent["iban"] = st.text_input("IBAN", ent["iban"], placeholder="FR76 ...")
+            ent["bic"] = st.text_input("BIC", ent["bic"])
+            ent["penalites_retard"] = st.text_area(
+                "Pénalités de retard", ent["penalites_retard"],
+                placeholder="Ex. 3 fois le taux d'intérêt légal, indemnité forfaitaire de 40 € "
+                            "pour frais de recouvrement.")
+            ent["mention_facture"] = st.text_input("Mention en pied de facture", ent["mention_facture"])
         if st.button("💾 Enregistrer mon entreprise", type="primary"):
             enregistrer_entreprise(ent)
             if logo_file is not None:
@@ -2457,10 +2769,15 @@ def main():
         devis = devis.merge(charger_complements(), on="numero", how="left")
         devis["total_ttc"] = devis.apply(total_devis_ttc, axis=1)
         attente = devis[devis["statut"] == "En attente"]
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Devis en attente de réponse", len(attente))
+        fac = charger_factures()
+        impaye = sum(montants_facture(r)["net_a_payer"] for _, r in fac.iterrows()
+                     if (_texte(r.get("statut_paiement")) or "À payer") == "À payer") \
+            if not fac.empty else 0.0
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Devis en attente", len(attente))
         m2.metric("Montant en attente (TTC)", _eur(attente["total_ttc"].sum()))
         m3.metric("Devis acceptés", int((devis["statut"] == "Accepté").sum()))
+        m4.metric("Factures à encaisser", _eur(impaye))
 
         st.subheader("Mes derniers devis")
         for _, r in devis.iloc[::-1].head(5).iterrows():
@@ -2478,13 +2795,14 @@ def main():
     p_accueil = st.Page(page_accueil, title="Accueil", icon="🏠", url_path="accueil", default=True)
     p_nouveau = st.Page(page_nouveau_devis, title="Nouveau devis", icon="🧾", url_path="nouveau-devis")
     p_devis = st.Page(page_mes_devis, title="Mes devis", icon="📋", url_path="mes-devis")
+    p_factures = st.Page(page_mes_factures, title="Mes factures", icon="🧾", url_path="mes-factures")
     p_clients = st.Page(page_clients, title="Mes clients", icon="👥", url_path="mes-clients")
     p_prix = st.Page(page_mes_prix, title="Mes prix", icon="📚", url_path="mes-prix")
     p_entreprise = st.Page(page_entreprise, title="Mon entreprise", icon="🏢", url_path="mon-entreprise")
     p_comptes = st.Page(page_comptes, icon="🔑", url_path="comptes",
                         title="Comptes utilisateurs" if est_admin else "Mon mot de passe")
     page = st.navigation({"": [p_accueil],
-                          "Devis": [p_nouveau, p_devis],
+                          "Devis & factures": [p_nouveau, p_devis, p_factures],
                           "Carnet": [p_clients, p_prix],
                           "Réglages": [p_entreprise, p_comptes]})
     with st.sidebar:
