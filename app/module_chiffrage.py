@@ -21,8 +21,10 @@ DB_PATH = Path("chiffrage.db")
 ENTREPRISE_PATH = Path("entreprise.json")
 LOGO_PATH = Path("logo.png")
 
-COLONNES = ["code", "designation", "unite", "prix_fourniture", "temps_mo", "nb_poseurs", "taux_horaire"]
+COLONNES = ["famille", "code", "designation", "unite", "prix_fourniture",
+            "temps_mo", "nb_poseurs", "taux_horaire", "favori"]
 UNITES = ["u", "ml", "m2", "m3", "h", "ens", "forfait", "kg"]
+FAMILLES = ["Chauffage", "Ventilation", "Climatisation", "Plomberie", "Régulation", "Divers"]
 CLIENT_COLS = ["nom", "adresse", "telephone", "email", "siret"]
 DEVIS_COLS = ["numero", "date_devis", "client_nom", "client_adresse", "date_debut",
               "duree", "marge_pct", "tva_pct", "lignes_json", "statut"]
@@ -127,16 +129,22 @@ def _ecrire(table, df):
     df.to_sql(table, eng, if_exists="replace", index=False)
 
 
+def _normaliser_biblio(df):
+    """Garantit les colonnes famille / favori (migration des anciennes bases)."""
+    for c in COLONNES:
+        if c not in df.columns:
+            df[c] = False if c == "favori" else ("" if c == "famille" else None)
+    df["famille"] = df["famille"].fillna("")
+    df["favori"] = df["favori"].fillna(False).astype(bool)
+    return df[COLONNES]
+
+
 def charger_bibliotheque():
-    return _lire("ouvrages", COLONNES)
+    return _normaliser_biblio(_lire("ouvrages", COLONNES))
 
 
 def enregistrer_bibliotheque(df):
-    df = df.copy()
-    for c in COLONNES:
-        if c not in df.columns:
-            df[c] = None
-    _ecrire("ouvrages", df[COLONNES])
+    _ecrire("ouvrages", _normaliser_biblio(df.copy()))
 
 
 def charger_favoris() -> list:
@@ -398,6 +406,25 @@ def to_excel_bytes(df) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
     return buf.getvalue()
+
+
+def to_excel_multi(feuilles: dict) -> bytes:
+    """Exporte plusieurs tableaux dans un seul classeur (une feuille chacun)."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for nom, df in feuilles.items():
+            (df if df is not None and not df.empty else pd.DataFrame()).to_excel(
+                w, index=False, sheet_name=str(nom)[:31])
+    return buf.getvalue()
+
+
+def sauvegarde_base_excel() -> bytes:
+    """Sauvegarde Excel de toute la base (un onglet par table)."""
+    return to_excel_multi({"Ouvrages": charger_bibliotheque(),
+                           "Ouvrages composés": charger_ensembles(),
+                           "Clients": charger_clients(),
+                           "Devis": charger_devis(),
+                           "Factures": charger_factures()})
 
 
 def generer_excel_devis(entreprise, infos, lignes, totaux) -> bytes:
@@ -1990,7 +2017,11 @@ def postes_frequents(biblio, devis, favoris, n=NB_POSTES_FREQUENTS) -> list:
     par_designation = {}
     for i in biblio.index:
         par_designation.setdefault(_texte(biblio.loc[i, "designation"]), i)
-    ordre = list(favoris) + sorted(compte, key=compte.get, reverse=True)
+    # Favoris cochés dans la biblio (colonne favori), puis favoris choisis dans
+    # le devis, puis les ouvrages les plus utilisés.
+    coches = [_texte(biblio.loc[i, "designation"]) for i in biblio.index
+              if "favori" in biblio.columns and bool(biblio.loc[i, "favori"])]
+    ordre = coches + list(favoris) + sorted(compte, key=compte.get, reverse=True)
     index = []
     for d in ordre:
         i = par_designation.get(d)
@@ -2367,7 +2398,9 @@ def main():
     # ---- BIBLIOTHÈQUE ----
     def ecran_ouvrages():
         with st.expander("📥 Importer / exporter"):
-            modele = pd.DataFrame([["P001", "Radiateur acier 1000W", "u", 120.0, 1.5, 1, None]], columns=COLONNES)
+            modele = pd.DataFrame(
+                [["Chauffage", "P001", "Radiateur acier 1000W", "u", 120.0, 1.5, 1, None, False]],
+                columns=COLONNES)
             st.download_button("Télécharger le modèle CSV", modele.to_csv(index=False).encode("utf-8"),
                                "modele_bibliotheque_prix.csv", "text/csv")
             st.download_button("⬇️ Exporter la biblio (Excel)", to_excel_bytes(charger_bibliotheque()),
@@ -2386,34 +2419,70 @@ def main():
                         df_import["nb_poseurs"] = 1
                     if "taux_horaire" not in df_import.columns:
                         df_import["taux_horaire"] = None
+                    if "famille" not in df_import.columns:
+                        df_import["famille"] = ""
+                    if "favori" not in df_import.columns:
+                        df_import["favori"] = False
                     base = pd.DataFrame(columns=COLONNES) if remplacer else charger_bibliotheque()
                     enregistrer_bibliotheque(pd.concat([base, df_import[COLONNES]], ignore_index=True))
                     st.success(f"{len(df_import)} ouvrage(s) importé(s).")
                     st.rerun()
 
-        recherche = st.text_input("🔍 Rechercher un ouvrage (désignation ou code)")
         biblio_full = charger_bibliotheque()
-        if recherche:
-            f = biblio_full[
-                biblio_full["designation"].str.contains(recherche, case=False, na=False)
-                | biblio_full["code"].str.contains(recherche, case=False, na=False)]
-            st.caption(f"{len(f)} résultat(s) :")
-            st.dataframe(f, use_container_width=True)
+
+        # --- Recherche / filtres (aperçu en lecture seule, l'édition reste sur le tableau) ---
+        fc1, fc2, fc3 = st.columns([2, 1, 1])
+        recherche = fc1.text_input("🔍 Rechercher (désignation ou code)")
+        familles_dispo = sorted([f for f in biblio_full["famille"].dropna().unique() if f])
+        fam_filtre = fc2.selectbox("Famille", ["Toutes"] + familles_dispo)
+        favoris_only = fc3.checkbox("⭐ Favoris seulement")
+        if recherche or fam_filtre != "Toutes" or favoris_only:
+            f = biblio_full.copy()
+            if recherche:
+                f = f[f["designation"].str.contains(recherche, case=False, na=False)
+                      | f["code"].str.contains(recherche, case=False, na=False)]
+            if fam_filtre != "Toutes":
+                f = f[f["famille"] == fam_filtre]
+            if favoris_only:
+                f = f[f["favori"]]
+            st.caption(f"{len(f)} résultat(s) — aperçu (l'édition se fait sur le tableau complet ci-dessous) :")
+            st.dataframe(f, use_container_width=True, hide_index=True)
 
         edite = st.data_editor(
             biblio_full, num_rows="dynamic", use_container_width=True,
             column_config={
+                "famille": st.column_config.SelectboxColumn("Famille", options=FAMILLES),
                 "code": "Code", "designation": "Désignation",
                 "unite": st.column_config.SelectboxColumn("Unité", options=UNITES),
                 "prix_fourniture": st.column_config.NumberColumn("Prix fourniture (€)", format="%.2f"),
                 "temps_mo": st.column_config.NumberColumn("Temps pose (h)", format="%.2f"),
                 "nb_poseurs": st.column_config.NumberColumn("Nb poseurs", format="%d", default=1),
                 "taux_horaire": st.column_config.NumberColumn("Taux horaire (€/h)", format="%.2f",
-                                                              help="Vide = taux par défaut")},
+                                                              help="Vide = taux par défaut"),
+                "favori": st.column_config.CheckboxColumn("⭐", help="Favori — remonté en haut dans le devis")},
             key="editeur_biblio")
         if st.button("💾 Enregistrer la bibliothèque"):
             enregistrer_bibliotheque(edite)
             st.toast("Bibliothèque enregistrée.", icon="✅")
+
+        # --- Dupliquer un ouvrage existant (base d'un nouveau) ---
+        if not biblio_full.empty:
+            with st.expander("📑 Dupliquer un ouvrage"):
+                idx = list(biblio_full.index)
+                src = st.selectbox(
+                    "Ouvrage à dupliquer", idx,
+                    format_func=lambda i: f"{biblio_full.loc[i, 'designation']} "
+                                          f"({biblio_full.loc[i, 'code'] or '—'})",
+                    key="dup_src")
+                if st.button("Créer une copie"):
+                    copie = biblio_full.loc[src].to_dict()
+                    copie["code"] = f"{copie.get('code') or 'OUV'}-copie"
+                    copie["designation"] = f"{copie.get('designation') or ''} (copie)"
+                    copie["favori"] = False
+                    enregistrer_bibliotheque(
+                        pd.concat([biblio_full, pd.DataFrame([copie])], ignore_index=True))
+                    st.success("Copie créée. Modifie-la dans le tableau ci-dessus.")
+                    st.rerun()
 
     # ---- OUVRAGES COMPOSÉS ----
     def ecran_ensembles():
@@ -2807,6 +2876,15 @@ def main():
                           "Réglages": [p_entreprise, p_comptes]})
     with st.sidebar:
         st.caption(f"Connecté : {st.session_state.get('user', '')}")
+        if est_admin:
+            with st.expander("🗄️ Sauvegarde de la base"):
+                st.caption("Télécharge tout (ouvrages, clients, devis, factures…) "
+                           "dans un seul fichier Excel.")
+                st.download_button(
+                    "💾 Télécharger la sauvegarde", sauvegarde_base_excel(),
+                    f"sauvegarde_chiffrage_{date.today().isoformat()}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
         if st.button("Se déconnecter", use_container_width=True):
             st.session_state.clear()
             st.rerun()
