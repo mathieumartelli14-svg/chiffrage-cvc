@@ -2145,7 +2145,8 @@ def postes_frequents(biblio, devis, favoris, n=NB_POSTES_FREQUENTS) -> list:
 
 
 TAUX_HORAIRE_DEFAUT = 45.0
-_CLES_NON_CONSERVEES = ("nd_fav_", "nd_x_", "nd_pdf", "nd_excel", "nd_recherche", "nd_favoris_sel")
+_CLES_NON_CONSERVEES = ("nd_fav_", "nd_x_", "nd_pdf", "nd_excel", "nd_recherche",
+                        "nd_favoris_sel", "nd_grille_")
 
 
 def _conserver_saisie():
@@ -2170,6 +2171,7 @@ def _reinitialiser_devis(message=None):
     st.session_state["nd_client_sel"] = NOUVEAU_CLIENT
     st.session_state.devis_lignes = []
     st.session_state.numero_courant = prochain_numero()
+    _bump_grille()
     if message:
         st.session_state["flash"] = message
 
@@ -2209,6 +2211,7 @@ def _cb_dupliquer(devis):
     st.session_state["nd_marge"] = _num(rec.get("marge_pct"))
     if _num(rec.get("tva_pct"), -1) in TVA_AUTORISEES:
         st.session_state["nd_tva"] = _num(rec.get("tva_pct"))
+    _bump_grille()
 
 
 def _cb_recherche(biblio, ensembles, taux_horaire):
@@ -2230,15 +2233,18 @@ def _cb_recherche(biblio, ensembles, taux_horaire):
         _ajouter_ouvrage(o, taux_horaire)
         st.session_state["flash"] = f"« {_texte(o.get('designation'))} » ajouté : indique la quantité."
     st.session_state["nd_recherche"] = None
+    _bump_grille()
 
 
 def _cb_favori(o, taux_horaire):
     _ajouter_ouvrage(o, taux_horaire)
     st.session_state["flash"] = f"« {_texte(o.get('designation'))} » ajouté : indique la quantité."
+    _bump_grille()
 
 
 def _cb_ligne_libre():
     st.session_state.devis_lignes.append(_nouvelle_ligne())
+    _bump_grille()
 
 
 def _cb_supprimer(identifiant):
@@ -2252,9 +2258,64 @@ def _cb_sans_mo():
     sans_mo = st.session_state.get("nd_sans_mo", False)
     for lg in st.session_state.devis_lignes:
         if _num(lg.get("mo_unit")):
-            pu = _num(lg.get("prix_fourniture")) + (0 if sans_mo else _num(lg.get("mo_unit")))
-            lg["prix_unitaire"] = pu
-            st.session_state[f"nd_pu_{lg['_id']}"] = pu
+            lg["prix_unitaire"] = _num(lg.get("prix_fourniture")) + (0 if sans_mo else _num(lg.get("mo_unit")))
+    _bump_grille()
+
+
+def _bump_grille():
+    """Force la grille à repartir des lignes courantes (après un ajout / une bascule)."""
+    st.session_state["nd_gid"] = pysecrets.token_hex(4)
+
+
+def grille_lignes_devis(lignes) -> list:
+    """Éditeur « tableur » façon Excel : une case par cellule, ajout/suppression
+    de lignes, total par ligne auto. Retourne les lignes reconstruites.
+    Les lignes venues de la bibliothèque gardent leur découpage fourniture / MO
+    (pour la bascule « fourniture seule »), tant que leur PU n'est pas modifié."""
+    st.session_state.setdefault("nd_gid", "0")
+    colonnes = {"_id": "object", "Section": "string", "Désignation": "string",
+                "Unité": "string", "Quantité": "float", "PU HT (€)": "float", "Total HT (€)": "float"}
+    if lignes:
+        df = pd.DataFrame([{"_id": lg.get("_id"), "Section": _texte(lg.get("groupe")),
+                            "Désignation": _texte(lg.get("designation")),
+                            "Unité": _texte(lg.get("unite")) or "u",
+                            "Quantité": _num(lg.get("quantite")),
+                            "PU HT (€)": _num(lg.get("prix_unitaire")),
+                            "Total HT (€)": _num(lg.get("quantite")) * _num(lg.get("prix_unitaire"))}
+                           for lg in lignes])
+    else:
+        df = pd.DataFrame({c: pd.Series(dtype=t) for c, t in colonnes.items()})
+    edited = st.data_editor(
+        df, num_rows="dynamic", use_container_width=True,
+        key=f"nd_grille_{st.session_state['nd_gid']}",
+        column_order=["Section", "Désignation", "Unité", "Quantité", "PU HT (€)", "Total HT (€)"],
+        column_config={
+            "Section": st.column_config.TextColumn("Section", help="Regroupe des lignes (facultatif)"),
+            "Désignation": st.column_config.TextColumn("Désignation", width="large"),
+            "Unité": st.column_config.TextColumn("Unité", width="small"),
+            "Quantité": st.column_config.NumberColumn("Qté", min_value=0.0, format="%.2f"),
+            "PU HT (€)": st.column_config.NumberColumn("PU HT", min_value=0.0, format="%.2f"),
+            "Total HT (€)": st.column_config.NumberColumn("Total HT", format="%.2f", disabled=True)})
+    par_id = {lg.get("_id"): lg for lg in lignes}
+    nouvelles = []
+    for r in edited.to_dict("records"):
+        desig, unite = _texte(r.get("Désignation")), _texte(r.get("Unité"))
+        q, pu = _num(r.get("Quantité")), _num(r.get("PU HT (€)"))
+        if not desig and not unite and _vide(r.get("Quantité")) and _vide(r.get("PU HT (€)")):
+            continue   # ligne entièrement vide : ignorée
+        orig = par_id.get(r.get("_id"))
+        if orig is not None:
+            fourn, mo, mo_active = _ventiler_pu(
+                pu, _num(orig.get("prix_fourniture")), _num(orig.get("mo_unit")),
+                True if _vide(orig.get("mo_active")) else bool(orig.get("mo_active")))
+            ident = orig.get("_id")
+        else:
+            fourn, mo, mo_active, ident = pu, 0.0, False, pysecrets.token_hex(4)
+        nouvelles.append({"_id": ident, "groupe": _texte(r.get("Section")), "designation": desig,
+                          "unite": unite or "u", "quantite": q, "prix_fourniture": fourn,
+                          "mo_unit": mo, "mo_active": bool(mo_active), "prix_unitaire": pu,
+                          "montant_ht": q * pu})
+    return nouvelles
 
 
 def onglet_nouveau_devis(ent, mef_entreprise, taux_horaire):
@@ -2357,36 +2418,18 @@ def onglet_nouveau_devis(ent, mef_entreprise, taux_horaire):
                 st.session_state["flash"] = "Postes fréquents enregistrés."
                 st.rerun()
 
-    # ---- ③ Lignes du devis ----
+    # ---- ③ Lignes du devis (grille façon Excel) ----
     st.markdown("#### ③ Lignes du devis")
-    erreurs = []
+    st.caption("Édite directement dans le tableau, comme dans Excel : clique une case et modifie-la, "
+               "ajoute une ligne avec le + en bas, supprime en cochant une ligne puis « 🗑 ». "
+               "Le total de chaque ligne et les totaux se recalculent tout seuls.")
     if not lignes:
-        st.info("Aucune ligne pour l'instant : cherche un ouvrage ou clique sur un poste fréquent.")
-    groupe_precedent = ""
-    for n, lg in enumerate(lignes, start=1):
-        i = lg["_id"]
-        groupe = _texte(lg.get("groupe"))
-        if groupe and groupe != groupe_precedent:
-            st.caption(f"🧩 {groupe}")
-        groupe_precedent = groupe
-        c = st.columns([5, 1.3, 1.8, 2, 1.8, 0.8], vertical_alignment="bottom")
-        # valeurs initiales posées dans l'état (pas de « value= ») : la saisie survit
-        # au changement d'écran, voir _conserver_saisie
-        st.session_state.setdefault(f"nd_d_{i}", _texte(lg.get("designation")))
-        st.session_state.setdefault(f"nd_u_{i}", _texte(lg.get("unite")))
-        st.session_state.setdefault(f"nd_q_{i}", max(_num(lg.get("quantite")), 0.0))
-        st.session_state.setdefault(f"nd_pu_{i}", max(_num(lg.get("prix_unitaire")), 0.0))
-        lg["designation"] = c[0].text_input("Désignation", key=f"nd_d_{i}",
-                                            placeholder="Désignation du poste")
-        lg["unite"] = c[1].text_input("Unité", key=f"nd_u_{i}")
-        lg["quantite"] = c[2].number_input("Quantité", min_value=0.0, step=1.0, key=f"nd_q_{i}")
-        lg["prix_unitaire"] = c[3].number_input("Prix unitaire HT (€)", min_value=0.0, step=1.0,
-                                                format="%.2f", key=f"nd_pu_{i}")
-        c[4].markdown(f"**{_eur(lg['quantite'] * lg['prix_unitaire'])}**")
-        c[5].button("🗑️", key=f"nd_x_{i}", help="Supprimer cette ligne",
-                    on_click=_cb_supprimer, args=(i,))
-        if not lg["designation"].strip():
-            erreurs.append(f"Ligne {n} : indique une désignation, ou supprime la ligne.")
+        st.info("Aucune ligne : cherche un ouvrage, clique un poste fréquent, ou ajoute directement "
+                "une ligne dans le tableau ci-dessous.")
+    lignes = grille_lignes_devis(lignes)
+    st.session_state.devis_lignes = lignes
+    erreurs = [f"Ligne {n} : indique une désignation, ou supprime la ligne."
+               for n, lg in enumerate(lignes, start=1) if not _texte(lg.get("designation"))]
     for e in erreurs:
         st.warning(e)
 
