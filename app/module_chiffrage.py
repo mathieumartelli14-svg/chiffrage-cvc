@@ -88,7 +88,11 @@ def _admin_owner() -> str:
 
 
 def _owner() -> str:
-    """Compte connecté, propriétaire des données lues/écrites cette session."""
+    """Compte dont on lit/écrit les données cette session. En « mode support »,
+    un administrateur peut consulter/corriger le compte d'un client."""
+    sup = _texte(st.session_state.get("support_owner"))
+    if sup and st.session_state.get("is_admin"):
+        return sup
     o = _texte(st.session_state.get("user"))
     return o or _admin_owner()
 
@@ -1671,6 +1675,19 @@ def panneau_comptes(zone=None):
                     st.warning("Transmets-le au client. Il ne sera plus affiché.")
                 else:
                     st.error("Compte introuvable.")
+
+            st.divider()
+            st.markdown("**🛟 Accéder à un compte (mode support)**")
+            st.caption("Entre dans le compte d'un client pour consulter et corriger ses données "
+                       "en cas de problème. Un bandeau te le rappelle en haut, et tu reviens à ton "
+                       "compte en un clic.")
+            cible_sup = st.selectbox("Compte à dépanner", comptes, key="adm_support")
+            if st.button(f"🛟 Entrer dans le compte « {cible_sup} »"):
+                st.session_state["support_owner"] = cible_sup
+                _reinitialiser_devis()   # repart d'un devis vierge, numéro du compte consulté
+                st.session_state["flash"] = f"Mode support activé : compte « {cible_sup} »."
+                st.rerun()
+
             st.divider()
             st.markdown("**Comptes existants**")
             st.dataframe(pd.DataFrame(lister_utilisateurs()), use_container_width=True,
@@ -3031,20 +3048,31 @@ def main():
                           "Devis & factures": [p_nouveau, p_devis, p_factures],
                           "Carnet": [p_clients, p_prix],
                           "Réglages": [p_entreprise, p_comptes]})
+    support = _texte(st.session_state.get("support_owner")) if est_admin else ""
     with st.sidebar:
         st.caption(f"Connecté : {st.session_state.get('user', '')}")
+        if support:
+            st.warning(f"🛟 Mode support\nCompte « {support} »")
+            if st.button("⟵ Revenir à mon compte (admin)", use_container_width=True, type="primary"):
+                st.session_state.pop("support_owner", None)
+                _reinitialiser_devis()   # repart d'un devis vierge, numéro de ton compte
+                st.session_state["flash"] = "Retour à ton compte admin."
+                st.rerun()
         if est_admin:
             with st.expander("🗄️ Sauvegarde de la base"):
                 st.caption("Télécharge tout (ouvrages, clients, devis, factures…) "
-                           "dans un seul fichier Excel.")
+                           "dans un seul fichier Excel." + (" (du compte consulté)" if support else ""))
                 st.download_button(
                     "💾 Télécharger la sauvegarde", sauvegarde_base_excel(),
-                    f"sauvegarde_chiffrage_{date.today().isoformat()}.xlsx",
+                    f"sauvegarde_chiffrage_{_slug(_owner())}_{date.today().isoformat()}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True)
         if st.button("Se déconnecter", use_container_width=True):
             st.session_state.clear()
             st.rerun()
+    if support:
+        st.warning(f"🛟 **Mode support** — tu consultes et modifies le compte « **{support}** ». "
+                   "Tout ce que tu fais ici agit sur SON compte. Reviens à ton compte via la barre de gauche.")
     page.run()
 
 
