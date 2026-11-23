@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from fpdf import FPDF
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 DB_PATH = Path("chiffrage.db")
 ENTREPRISE_PATH = Path("entreprise.json")
@@ -72,36 +72,126 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
+# --- Isolation par compte -----------------------------------------------------
+# Chaque compte ne voit que SES données : une colonne « owner » sur chaque table
+# métier, et toutes les lectures/écritures filtrées sur le compte connecté.
+OWNER_TABLES = {"ouvrages", "ensembles", "clients", "devis", "devis_complements",
+                "favoris", "factures"}
+
+
+def _admin_owner() -> str:
+    """Identifiant du compte administrateur (= st.secrets['APP_USER'])."""
+    try:
+        return st.secrets["APP_USER"] or "admin"
+    except Exception:
+        return "admin"
+
+
+def _owner() -> str:
+    """Compte connecté, propriétaire des données lues/écrites cette session."""
+    o = _texte(st.session_state.get("user"))
+    return o or _admin_owner()
+
+
+def _slug(valeur) -> str:
+    s = "".join(c if c.isalnum() else "_" for c in str(valeur).lower())
+    return s or "defaut"
+
+
+def _fichier_entreprise(owner=None) -> Path:
+    return Path(f"entreprise_{_slug(owner or _owner())}.json")
+
+
+def logo_path(owner=None) -> Path:
+    return Path(f"logo_{_slug(owner or _owner())}.png")
+
+
+def logo_actuel(owner=None) -> Path:
+    """Logo à afficher/imprimer pour le compte : son fichier, sinon l'ancien
+    logo.png global pour l'administrateur (migration douce)."""
+    p = logo_path(owner)
+    if not p.exists() and (owner or _owner()) == _admin_owner() and LOGO_PATH.exists():
+        return LOGO_PATH
+    return p
+
+
 def init_db():
     eng = get_engine()
     with eng.begin() as con:
         con.execute(text("""CREATE TABLE IF NOT EXISTS ouvrages (
-            code TEXT, designation TEXT, unite TEXT,
+            owner TEXT, famille TEXT, code TEXT, designation TEXT, unite TEXT,
             prix_fourniture DOUBLE PRECISION, temps_mo DOUBLE PRECISION,
-            nb_poseurs DOUBLE PRECISION, taux_horaire DOUBLE PRECISION)"""))
+            nb_poseurs DOUBLE PRECISION, taux_horaire DOUBLE PRECISION, favori BOOLEAN)"""))
         con.execute(text("""CREATE TABLE IF NOT EXISTS ensembles (
-            nom TEXT, designation TEXT, quantite DOUBLE PRECISION)"""))
+            owner TEXT, nom TEXT, designation TEXT, quantite DOUBLE PRECISION)"""))
         con.execute(text("""CREATE TABLE IF NOT EXISTS clients (
-            nom TEXT, adresse TEXT, telephone TEXT, email TEXT, siret TEXT)"""))
+            owner TEXT, nom TEXT, adresse TEXT, telephone TEXT, email TEXT, siret TEXT)"""))
         con.execute(text("""CREATE TABLE IF NOT EXISTS devis (
-            numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
+            owner TEXT, numero TEXT, date_devis TEXT, client_nom TEXT, client_adresse TEXT,
             date_debut TEXT, duree TEXT, marge_pct DOUBLE PRECISION,
             tva_pct DOUBLE PRECISION, lignes_json TEXT, statut TEXT)"""))
         con.execute(text("""CREATE TABLE IF NOT EXISTS devis_complements (
-            numero TEXT PRIMARY KEY, remise_type TEXT, remise_valeur DOUBLE PRECISION,
-            mentions TEXT, date_modif TEXT)"""))
-        con.execute(text("CREATE TABLE IF NOT EXISTS favoris (designation TEXT PRIMARY KEY)"))
+            owner TEXT, numero TEXT, remise_type TEXT, remise_valeur DOUBLE PRECISION,
+            mentions TEXT, date_modif TEXT, mise_en_forme TEXT, options_variantes TEXT,
+            PRIMARY KEY (owner, numero))"""))
+        con.execute(text("CREATE TABLE IF NOT EXISTS favoris (owner TEXT, designation TEXT)"))
         con.execute(text("""CREATE TABLE IF NOT EXISTS factures (
-            numero TEXT PRIMARY KEY, numero_devis TEXT, date_facture TEXT,
+            owner TEXT, numero TEXT, numero_devis TEXT, date_facture TEXT,
             client_nom TEXT, client_adresse TEXT, lignes_json TEXT,
             marge_pct DOUBLE PRECISION, tva_pct DOUBLE PRECISION,
             remise_type TEXT, remise_valeur DOUBLE PRECISION,
             type_facture TEXT, acompte_pct DOUBLE PRECISION, acompte_verse DOUBLE PRECISION,
             mentions TEXT, mise_en_forme TEXT,
-            statut_paiement TEXT, date_paiement TEXT, date_modif TEXT)"""))
+            statut_paiement TEXT, date_paiement TEXT, date_modif TEXT,
+            PRIMARY KEY (owner, numero))"""))
     # migration douce : colonnes ajoutées après coup (jamais supprimées)
+    _ajouter_colonnes("ouvrages", {"famille": "TEXT", "favori": "BOOLEAN"})
     _ajouter_colonnes("devis_complements", {"mise_en_forme": "TEXT", "options_variantes": "TEXT"})
+    _migrer_isolation()
     init_utilisateurs()
+
+
+def _migrer_isolation():
+    """Ajoute la colonne « owner » aux bases créées avant l'isolation et attribue
+    les données existantes à l'administrateur. Les factures/compléments/favoris
+    (nouveaux, souvent vides) sont recréés avec une clé par compte."""
+    eng = get_engine()
+    admin = _admin_owner()
+    insp = inspect(eng)
+    with eng.begin() as con:
+        for table in ("ouvrages", "ensembles", "clients", "devis", "factures",
+                      "devis_complements", "favoris"):
+            cols = {c["name"] for c in insp.get_columns(table)}
+            if "owner" in cols:
+                continue
+            vide = con.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() == 0
+            if table in ("favoris", "factures", "devis_complements") and vide:
+                # tables récentes et vides : on repart sur le schéma à clé par compte
+                con.execute(text(f"DROP TABLE {table}"))
+            else:
+                con.execute(text(f"ALTER TABLE {table} ADD COLUMN owner TEXT"))
+                con.execute(text(f"UPDATE {table} SET owner = :a WHERE owner IS NULL"),
+                            {"a": admin})
+    # recrée les tables récentes supprimées, avec le schéma à clé par compte
+    init_db_tables_isolees()
+
+
+def init_db_tables_isolees():
+    with get_engine().begin() as con:
+        con.execute(text("CREATE TABLE IF NOT EXISTS favoris (owner TEXT, designation TEXT)"))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS devis_complements (
+            owner TEXT, numero TEXT, remise_type TEXT, remise_valeur DOUBLE PRECISION,
+            mentions TEXT, date_modif TEXT, mise_en_forme TEXT, options_variantes TEXT,
+            PRIMARY KEY (owner, numero))"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS factures (
+            owner TEXT, numero TEXT, numero_devis TEXT, date_facture TEXT,
+            client_nom TEXT, client_adresse TEXT, lignes_json TEXT,
+            marge_pct DOUBLE PRECISION, tva_pct DOUBLE PRECISION,
+            remise_type TEXT, remise_valeur DOUBLE PRECISION,
+            type_facture TEXT, acompte_pct DOUBLE PRECISION, acompte_verse DOUBLE PRECISION,
+            mentions TEXT, mise_en_forme TEXT,
+            statut_paiement TEXT, date_paiement TEXT, date_modif TEXT,
+            PRIMARY KEY (owner, numero))"""))
 
 
 def _ajouter_colonnes(table, colonnes: dict):
@@ -116,17 +206,34 @@ def _ajouter_colonnes(table, colonnes: dict):
 
 
 def _lire(table, cols):
+    """Lit une table. Pour les tables métier, ne renvoie que les lignes du compte
+    connecté (la colonne owner est retirée du résultat)."""
     eng = get_engine()
     try:
-        df = pd.read_sql_query(f"SELECT * FROM {table}", eng)
+        if table in OWNER_TABLES:
+            df = pd.read_sql_query(text(f"SELECT * FROM {table} WHERE owner = :o"),
+                                   eng, params={"o": _owner()})
+        else:
+            df = pd.read_sql_query(f"SELECT * FROM {table}", eng)
     except Exception:
         return pd.DataFrame(columns=cols)
+    if "owner" in df.columns:
+        df = df.drop(columns=["owner"])
     return df if not df.empty else pd.DataFrame(columns=cols)
 
 
 def _ecrire(table, df):
+    """Écrit une table. Pour les tables métier, ne remplace QUE les lignes du
+    compte connecté (les données des autres comptes ne sont jamais touchées)."""
     eng = get_engine()
-    df.to_sql(table, eng, if_exists="replace", index=False)
+    if table in OWNER_TABLES:
+        df = df.copy()
+        df["owner"] = _owner()
+        with eng.begin() as con:
+            con.execute(text(f"DELETE FROM {table} WHERE owner = :o"), {"o": _owner()})
+            df.to_sql(table, con, if_exists="append", index=False)
+    else:
+        df.to_sql(table, eng, if_exists="replace", index=False)
 
 
 def _normaliser_biblio(df):
@@ -154,9 +261,10 @@ def charger_favoris() -> list:
 
 def enregistrer_favoris(designations):
     with get_engine().begin() as con:
-        con.execute(text("DELETE FROM favoris"))
+        con.execute(text("DELETE FROM favoris WHERE owner = :o"), {"o": _owner()})
         for d in dict.fromkeys(designations):
-            con.execute(text("INSERT INTO favoris (designation) VALUES (:d)"), {"d": d})
+            con.execute(text("INSERT INTO favoris (owner, designation) VALUES (:o, :d)"),
+                        {"o": _owner(), "d": d})
 
 
 def charger_ensembles():
@@ -255,12 +363,13 @@ def surcharge_mise_en_forme(valeur):
 def enregistrer_mise_en_forme(numero: str, surcharge, options: str):
     """Mise en forme propre à un devis (None = suit l'entreprise) + options non chiffrées."""
     with get_engine().begin() as con:
-        con.execute(text("""INSERT INTO devis_complements (numero, mise_en_forme, options_variantes)
-            VALUES (:n, :f, :o)
-            ON CONFLICT (numero) DO UPDATE SET
+        con.execute(text("""INSERT INTO devis_complements (owner, numero, mise_en_forme, options_variantes)
+            VALUES (:ow, :n, :f, :o)
+            ON CONFLICT (owner, numero) DO UPDATE SET
               mise_en_forme = EXCLUDED.mise_en_forme,
               options_variantes = EXCLUDED.options_variantes"""),
-            {"n": numero, "f": json.dumps(surcharge, ensure_ascii=False) if surcharge else None,
+            {"ow": _owner(), "n": numero,
+             "f": json.dumps(surcharge, ensure_ascii=False) if surcharge else None,
              "o": (options or "").strip() or None})
 
 
@@ -268,12 +377,12 @@ def enregistrer_complement(numero: str, remise_type: str, remise_valeur: float, 
     """Upsert de la ligne annexe + horodatage de la modification."""
     with get_engine().begin() as con:
         con.execute(text("""INSERT INTO devis_complements
-            (numero, remise_type, remise_valeur, mentions, date_modif)
-            VALUES (:n, :t, :v, :m, :d)
-            ON CONFLICT (numero) DO UPDATE SET
+            (owner, numero, remise_type, remise_valeur, mentions, date_modif)
+            VALUES (:ow, :n, :t, :v, :m, :d)
+            ON CONFLICT (owner, numero) DO UPDATE SET
               remise_type = EXCLUDED.remise_type, remise_valeur = EXCLUDED.remise_valeur,
               mentions = EXCLUDED.mentions, date_modif = EXCLUDED.date_modif"""),
-            {"n": numero, "t": remise_type, "v": float(remise_valeur), "m": mentions,
+            {"ow": _owner(), "n": numero, "t": remise_type, "v": float(remise_valeur), "m": mentions,
              "d": datetime.now().strftime("%Y-%m-%d %H:%M")})
 
 
@@ -305,8 +414,9 @@ def prochain_numero_facture() -> str:
 
 def sauvegarder_facture(record) -> bool:
     champs = {c: record.get(c) for c in FACTURE_COLS}
-    cols = ", ".join(FACTURE_COLS)
-    params = ", ".join(f":{c}" for c in FACTURE_COLS)
+    champs["owner"] = _owner()
+    cols = "owner, " + ", ".join(FACTURE_COLS)
+    params = ":owner, " + ", ".join(f":{c}" for c in FACTURE_COLS)
     try:
         with get_engine().begin() as con:
             con.execute(text(f"INSERT INTO factures ({cols}) VALUES ({params})"), champs)
@@ -321,8 +431,9 @@ def mettre_a_jour_facture(numero: str, champs: dict) -> bool:
         return False
     set_clause = ", ".join(f"{c} = :{c}" for c in champs)
     with get_engine().begin() as con:
-        res = con.execute(text(f"UPDATE factures SET {set_clause} WHERE numero = :numero"),
-                          {**champs, "numero": numero})
+        res = con.execute(
+            text(f"UPDATE factures SET {set_clause} WHERE owner = :owner AND numero = :numero"),
+            {**champs, "owner": _owner(), "numero": numero})
     return res.rowcount > 0
 
 
@@ -384,21 +495,24 @@ def creer_facture(rec_devis, type_facture: str, acompte_pct: float) -> tuple:
 
 
 def charger_entreprise():
-    # Valeurs par défaut = migration douce : un ancien entreprise.json sans
-    # les nouveaux champs reste valide, ils prennent simplement ces valeurs.
+    # Fiche entreprise propre au compte connecté. L'ancien fichier global
+    # (entreprise.json) reste la fiche de l'administrateur (migration douce).
     base = {c: "" for c in ENTREPRISE_CHAMPS}
     base["validite_jours"] = "30"
     base["mention_devis"] = MENTION_DEVIS_DEFAUT
-    if ENTREPRISE_PATH.exists():
+    fichier = _fichier_entreprise()
+    if not fichier.exists() and _owner() == _admin_owner() and ENTREPRISE_PATH.exists():
+        fichier = ENTREPRISE_PATH   # l'admin hérite de l'ancienne fiche globale
+    if fichier.exists():
         try:
-            base.update(json.loads(ENTREPRISE_PATH.read_text(encoding="utf-8")))
+            base.update(json.loads(fichier.read_text(encoding="utf-8")))
         except Exception:
             pass
     return base
 
 
 def enregistrer_entreprise(d):
-    ENTREPRISE_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    _fichier_entreprise().write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def to_excel_bytes(df) -> bytes:
@@ -782,11 +896,11 @@ def _validite(infos, ent) -> str:
 
 def _taille_logo(l_max, h_max):
     """(largeur, hauteur) du logo ramené dans sa boîte, ratio conservé ; None si absent."""
-    if not LOGO_PATH.exists():
+    if not logo_actuel().exists():
         return None
     try:
         from PIL import Image
-        with Image.open(LOGO_PATH) as im:
+        with Image.open(logo_actuel()) as im:
             lw, lh = im.size
         k = min(l_max / lw, h_max / lh)
         return lw * k, lh * k
@@ -985,7 +1099,7 @@ def _entete_page1(pdf, ent, infos):
             x_logo = x + pdf.c_margin
             y_gauche = haut + h + 3
         try:
-            pdf.image(str(LOGO_PATH), x=x_logo, y=haut, w=w, h=h)
+            pdf.image(str(logo_actuel()), x=x_logo, y=haut, w=w, h=h)
         except Exception:
             y_gauche = y_droite = haut
     pdf.set_y(y_gauche)
@@ -1605,7 +1719,7 @@ def afficher_apercu(ent, mef, infos=None, lignes=None, totaux=None):
     if not lignes:
         infos, lignes = _EXEMPLE_APERCU["infos"], _EXEMPLE_APERCU["lignes"]
         totaux = calculer_totaux(lignes, 0, mef["tva_defaut"])
-    signature_logo = LOGO_PATH.stat().st_mtime if LOGO_PATH.exists() else 0
+    signature_logo = logo_actuel().stat().st_mtime if logo_actuel().exists() else 0
     png = _apercu_png(json.dumps(ent, ensure_ascii=False, sort_keys=True, default=str),
                       json.dumps(mef, sort_keys=True),
                       json.dumps({"infos": infos, "lignes": lignes, "totaux": totaux},
@@ -2739,8 +2853,8 @@ def main():
         g, d = st.columns(2, gap="large")
         with g:
             st.markdown("**Identité**")
-            if LOGO_PATH.exists():
-                st.image(str(LOGO_PATH), width=160, caption="Logo actuel")
+            if logo_actuel().exists():
+                st.image(str(logo_actuel()), width=160, caption="Logo actuel")
             logo_file = st.file_uploader("Logo (PNG / JPG)", type=["png", "jpg", "jpeg"], key="logo_up")
             ent["raison_sociale"] = st.text_input("Raison sociale", ent["raison_sociale"])
             ent["forme_juridique"] = st.text_input("Forme juridique", ent["forme_juridique"])
@@ -2780,7 +2894,7 @@ def main():
         if st.button("💾 Enregistrer mon entreprise", type="primary"):
             enregistrer_entreprise(ent)
             if logo_file is not None:
-                LOGO_PATH.write_bytes(logo_file.getvalue())
+                logo_path().write_bytes(logo_file.getvalue())
             st.session_state["flash"] = "Fiche entreprise enregistrée."
             st.rerun()
 
