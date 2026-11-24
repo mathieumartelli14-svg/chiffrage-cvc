@@ -5,3 +5,8 @@ __pycache__/
 
 # Secrets, où qu'ils soient (sécurité)
 **/secrets.toml
+
+# Réglage notifications (contient une adresse mail)
+notifications_admin.json
+entreprise_*.json
+logo_*.png

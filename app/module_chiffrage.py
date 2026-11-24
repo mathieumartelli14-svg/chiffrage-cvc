@@ -7,6 +7,9 @@
 import json
 import hashlib
 import secrets as pysecrets
+import smtplib
+import ssl
+from email.message import EmailMessage
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -517,6 +520,93 @@ def charger_entreprise():
 
 def enregistrer_entreprise(d):
     _fichier_entreprise().write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# NOTIFICATIONS PAR MAIL (alertes à l'administrateur)
+# ----------------------------------------------------------------------------
+NOTIF_PATH = Path("notifications_admin.json")   # réglage global, modifiable par l'admin
+
+
+def charger_notif() -> dict:
+    base = {"email": "", "actif": False}
+    if NOTIF_PATH.exists():
+        try:
+            base.update(json.loads(NOTIF_PATH.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return base
+
+
+def enregistrer_notif(email, actif):
+    NOTIF_PATH.write_text(json.dumps({"email": _texte(email), "actif": bool(actif)},
+                                     ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _smtp_config():
+    """Réglages SMTP depuis les secrets (None si non configuré)."""
+    try:
+        s = st.secrets["smtp"]
+        return {"host": s["host"], "port": int(s.get("port", 587)), "user": s["user"],
+                "password": s["password"], "from": s.get("from", s["user"]),
+                "tls": bool(s.get("tls", True))}
+    except Exception:
+        return None
+
+
+def smtp_pret() -> bool:
+    return _smtp_config() is not None
+
+
+def envoyer_mail(destinataire, sujet, corps) -> bool:
+    """Envoi best-effort ; False si SMTP non configuré, destinataire vide, ou erreur."""
+    cfg = _smtp_config()
+    if not cfg or not _texte(destinataire):
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = sujet, cfg["from"], destinataire
+        msg.set_content(corps)
+        ctx = ssl.create_default_context()
+        if cfg["tls"]:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as srv:
+                srv.starttls(context=ctx)
+                srv.login(cfg["user"], cfg["password"])
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=15, context=ctx) as srv:
+                srv.login(cfg["user"], cfg["password"])
+                srv.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def notifier_admin(action: str, compte: str = None) -> bool:
+    """Alerte générique à l'admin : quel compte, quelle action, quand. N'inclut
+    AUCUNE donnée confidentielle (ni nom client, ni montant, ni contenu)."""
+    notif = charger_notif()
+    if not (notif["actif"] and notif["email"]):
+        return False
+    compte = compte or _owner()
+    sujet = f"[Chiffrage CVC] {action} — compte {compte}"
+    corps = (f"Une action a eu lieu dans ton logiciel de chiffrage.\n\n"
+             f"Compte : {compte}\nAction : {action}\n"
+             f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+             f"(Alerte automatique — aucune information confidentielle du compte n'est incluse.)")
+    return envoyer_mail(notif["email"], sujet, corps)
+
+
+def envoyer_question_admin(compte: str, question: str) -> bool:
+    """Un compte envoie une question à l'administrateur (le message part, car c'est
+    une demande volontaire du client, pas une donnée confidentielle du compte)."""
+    dest = charger_notif()["email"]
+    if not (dest and _texte(question)):
+        return False
+    sujet = f"[Chiffrage CVC] Question du compte {compte}"
+    corps = (f"Le compte « {compte} » t'a envoyé une question :\n\n{question}\n\n—\n"
+             f"(Date : {datetime.now().strftime('%d/%m/%Y %H:%M')})")
+    return envoyer_mail(dest, sujet, corps)
 
 
 def to_excel_bytes(df) -> bytes:
@@ -1803,6 +1893,20 @@ def panneau_comptes(zone=None):
                     st.success("Mot de passe modifié.")
                 else:
                     st.error("Mot de passe actuel incorrect.")
+        with zone.expander("❓ Poser une question à l'administrateur", expanded=zone is st):
+            st.caption("Ton message est envoyé par mail à l'administrateur. "
+                       "Il ne voit aucune de tes données, seulement ta question.")
+            q = st.text_area("Ta question", key="q_admin", height=100,
+                             placeholder="Ex. Comment ajouter un ouvrage à mon devis ?")
+            if st.button("📨 Envoyer la question"):
+                if not q.strip():
+                    st.error("Écris ta question d'abord.")
+                elif envoyer_question_admin(st.session_state.get("user", ""), q.strip()):
+                    st.success("Question envoyée à l'administrateur.")
+                    st.session_state["q_admin"] = ""
+                else:
+                    st.warning("Envoi impossible pour l'instant (l'administrateur n'a pas encore "
+                               "activé la réception des mails). Réessaie plus tard.")
         return
 
     with zone.expander("👤 Gestion des comptes (admin)", expanded=zone is st):
@@ -1854,6 +1958,36 @@ def panneau_comptes(zone=None):
             st.markdown("**Comptes existants**")
             st.dataframe(pd.DataFrame(lister_utilisateurs()), use_container_width=True,
                          hide_index=True)
+
+    with zone.expander("🔔 Notifications par mail (admin)", expanded=False):
+        st.caption("Reçois un mail à chaque enregistrement important (devis, facture, client, prix) "
+                   "dans n'importe quel compte, et les questions des comptes clients. Les alertes "
+                   "automatiques ne contiennent aucune donnée confidentielle (juste le compte, "
+                   "l'action et l'heure).")
+        notif = charger_notif()
+        email = st.text_input("Adresse mail où recevoir les alertes", value=notif["email"],
+                              key="notif_email", placeholder="toi@exemple.fr")
+        actif = st.checkbox("Activer les alertes automatiques", value=notif["actif"],
+                            key="notif_actif")
+        c_n1, c_n2 = st.columns(2)
+        if c_n1.button("💾 Enregistrer", key="notif_save"):
+            enregistrer_notif(email, actif)
+            st.success("Réglage des notifications enregistré.")
+        if c_n2.button("✉️ Envoyer un mail de test", key="notif_test"):
+            if not _texte(email):
+                st.error("Indique d'abord une adresse mail.")
+            elif not smtp_pret():
+                st.warning("L'envoi de mails n'est pas encore configuré (SMTP). Je peux te guider "
+                           "pour l'activer avec ton adresse mail.")
+            elif envoyer_mail(email, "[Chiffrage CVC] Test",
+                              "Ceci est un mail de test depuis ton logiciel de chiffrage. "
+                              "Si tu le reçois, les notifications fonctionnent."):
+                st.success("Mail de test envoyé. Vérifie ta boîte.")
+            else:
+                st.error("Échec de l'envoi : vérifie la configuration SMTP.")
+        if not smtp_pret():
+            st.info("ℹ️ L'envoi de mails n'est pas encore branché. Donne-moi le feu vert et je "
+                    "t'explique comment le configurer (mot de passe d'application Gmail, par ex.).")
 
 
 # ----------------------------------------------------------------------------
@@ -2722,6 +2856,7 @@ def onglet_nouveau_devis(ent, mef_entreprise, taux_horaire):
                         [clients, pd.DataFrame([{"nom": client_nom.strip(), "adresse": client_adresse}])],
                         ignore_index=True))
                 st.session_state["nd_enregistre"] = True
+                notifier_admin("Devis mis à jour" if deja_enregistre else "Devis enregistré")
                 st.session_state["flash"] = (f"Devis {numero} mis à jour." if deja_enregistre
                                              else f"Devis {numero} enregistré.")
                 st.rerun()
@@ -2840,6 +2975,7 @@ def main():
             key="editeur_biblio")
         if st.button("💾 Enregistrer la bibliothèque"):
             enregistrer_bibliotheque(edite)
+            notifier_admin("Prix (bibliothèque) mis à jour")
             st.toast("Bibliothèque enregistrée.", icon="✅")
 
         # --- Dupliquer un ouvrage existant (base d'un nouveau) ---
@@ -2900,6 +3036,7 @@ def main():
             key="editeur_clients")
         if st.button("💾 Enregistrer les clients"):
             enregistrer_clients(edite_c)
+            notifier_admin("Clients mis à jour")
             st.toast("Clients enregistrés.", icon="✅")
 
     # ---- MISE EN FORME (préférences entreprise) ----
@@ -3002,6 +3139,7 @@ def main():
                 if fc[2].button("🧾 Créer la facture", type="primary", use_container_width=True):
                     ok, num = creer_facture(rec, type_f, pct)
                     if ok:
+                        notifier_admin("Facture créée")
                         st.session_state["flash"] = f"Facture {num} créée (voir « Mes factures »)."
                         st.rerun()
                     else:
