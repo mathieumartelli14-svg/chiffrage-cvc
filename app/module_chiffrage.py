@@ -9,6 +9,7 @@ import hashlib
 import secrets as pysecrets
 import smtplib
 import ssl
+import tempfile
 from email.message import EmailMessage
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
@@ -113,13 +114,65 @@ def logo_path(owner=None) -> Path:
     return Path(f"logo_{_slug(owner or _owner())}.png")
 
 
+# --- Réglages persistants en base (fiche entreprise, logo, notifications) -----
+# Stockés dans Supabase pour survivre à un hébergement en ligne (système de
+# fichiers éphémère). Clé (owner, cle) ; « valeur » = texte, « blob » = binaire.
+_LOGO_CACHE_DIR = Path(tempfile.gettempdir()) / "chiffrage_logos"
+
+
+def _reglage_lire(owner, cle):
+    """Renvoie (valeur, blob, maj) pour ce réglage, ou None."""
+    try:
+        with get_engine().begin() as con:
+            return con.execute(
+                text("SELECT valeur, blob, maj FROM reglages WHERE owner=:o AND cle=:c"),
+                {"o": owner, "c": cle}).fetchone()
+    except Exception:
+        return None
+
+
+def _reglage_ecrire(owner, cle, valeur=None, blob=None, maj=None):
+    with get_engine().begin() as con:
+        con.execute(text("DELETE FROM reglages WHERE owner=:o AND cle=:c"),
+                    {"o": owner, "c": cle})
+        con.execute(text("INSERT INTO reglages (owner, cle, valeur, blob, maj) "
+                         "VALUES (:o, :c, :v, :b, :m)"),
+                    {"o": owner, "c": cle, "v": valeur, "b": blob, "m": maj})
+
+
+def enregistrer_logo(donnees: bytes, owner=None):
+    maj = datetime.now().strftime("%Y%m%d%H%M%S")
+    _reglage_ecrire(owner or _owner(), "logo", valeur=maj, blob=donnees, maj=maj)
+
+
 def logo_actuel(owner=None) -> Path:
-    """Logo à afficher/imprimer pour le compte : son fichier, sinon l'ancien
-    logo.png global pour l'administrateur (migration douce)."""
-    p = logo_path(owner)
-    if not p.exists() and (owner or _owner()) == _admin_owner() and LOGO_PATH.exists():
-        return LOGO_PATH
-    return p
+    """Chemin d'un fichier logo utilisable (image PDF/aperçu). Le logo est stocké
+    en base ; on le matérialise dans un fichier temporaire. Migration douce depuis
+    les anciens fichiers locaux (logo_<compte>.png, logo.png)."""
+    owner = owner or _owner()
+    row = _reglage_lire(owner, "logo")
+    if not (row and row[1]):
+        anc = logo_path(owner)
+        if not anc.exists() and owner == _admin_owner() and LOGO_PATH.exists():
+            anc = LOGO_PATH
+        if anc.exists():
+            try:
+                enregistrer_logo(anc.read_bytes(), owner)
+                row = _reglage_lire(owner, "logo")
+            except Exception:
+                return anc
+    if row and row[1]:
+        maj = row[2] or "0"
+        cible = _LOGO_CACHE_DIR / f"logo_{_slug(owner)}_{maj}.png"
+        if not cible.exists():
+            try:
+                _LOGO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cible.write_bytes(bytes(row[1]))
+            except Exception:
+                pass
+        if cible.exists():
+            return cible
+    return _LOGO_CACHE_DIR / f"__absent_{_slug(owner)}.png"   # chemin inexistant
 
 
 def init_db():
@@ -151,6 +204,9 @@ def init_db():
             mentions TEXT, mise_en_forme TEXT,
             statut_paiement TEXT, date_paiement TEXT, date_modif TEXT,
             PRIMARY KEY (owner, numero))"""))
+        con.execute(text("""CREATE TABLE IF NOT EXISTS reglages (
+            owner TEXT, cle TEXT, valeur TEXT, blob BYTEA, maj TEXT,
+            PRIMARY KEY (owner, cle))"""))
     # migration douce : colonnes ajoutées après coup (jamais supprimées)
     _ajouter_colonnes("ouvrages", {"famille": "TEXT", "favori": "BOOLEAN"})
     _ajouter_colonnes("devis_complements", {"mise_en_forme": "TEXT", "options_variantes": "TEXT"})
@@ -502,24 +558,36 @@ def creer_facture(rec_devis, type_facture: str, acompte_pct: float) -> tuple:
 
 
 def charger_entreprise():
-    # Fiche entreprise propre au compte connecté. L'ancien fichier global
-    # (entreprise.json) reste la fiche de l'administrateur (migration douce).
+    # Fiche entreprise propre au compte connecté, stockée en base. Migration douce
+    # depuis l'ancien fichier (entreprise_<compte>.json, ou entreprise.json global
+    # pour l'administrateur) : rapatriée en base à la première lecture.
     base = {c: "" for c in ENTREPRISE_CHAMPS}
     base["validite_jours"] = "30"
     base["mention_devis"] = MENTION_DEVIS_DEFAUT
-    fichier = _fichier_entreprise()
-    if not fichier.exists() and _owner() == _admin_owner() and ENTREPRISE_PATH.exists():
-        fichier = ENTREPRISE_PATH   # l'admin hérite de l'ancienne fiche globale
-    if fichier.exists():
+    data = None
+    row = _reglage_lire(_owner(), "entreprise")
+    if row and row[0]:
         try:
-            base.update(json.loads(fichier.read_text(encoding="utf-8")))
+            data = json.loads(row[0])
         except Exception:
-            pass
+            data = None
+    if data is None:
+        fichier = _fichier_entreprise()
+        if not fichier.exists() and _owner() == _admin_owner() and ENTREPRISE_PATH.exists():
+            fichier = ENTREPRISE_PATH
+        if fichier.exists():
+            try:
+                data = json.loads(fichier.read_text(encoding="utf-8"))
+                _reglage_ecrire(_owner(), "entreprise", json.dumps(data, ensure_ascii=False))
+            except Exception:
+                data = None
+    if data:
+        base.update(data)
     return base
 
 
 def enregistrer_entreprise(d):
-    _fichier_entreprise().write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    _reglage_ecrire(_owner(), "entreprise", json.dumps(d, ensure_ascii=False))
 
 
 # ----------------------------------------------------------------------------
@@ -529,18 +597,30 @@ NOTIF_PATH = Path("notifications_admin.json")   # réglage global, modifiable pa
 
 
 def charger_notif() -> dict:
+    # Réglage global (administrateur), stocké en base. Migration douce depuis
+    # l'ancien fichier notifications_admin.json à la première lecture.
     base = {"email": "", "actif": False}
-    if NOTIF_PATH.exists():
+    data = None
+    row = _reglage_lire(_admin_owner(), "notif")
+    if row and row[0]:
         try:
-            base.update(json.loads(NOTIF_PATH.read_text(encoding="utf-8")))
+            data = json.loads(row[0])
         except Exception:
-            pass
+            data = None
+    if data is None and NOTIF_PATH.exists():
+        try:
+            data = json.loads(NOTIF_PATH.read_text(encoding="utf-8"))
+            _reglage_ecrire(_admin_owner(), "notif", json.dumps(data, ensure_ascii=False))
+        except Exception:
+            data = None
+    if data:
+        base.update(data)
     return base
 
 
 def enregistrer_notif(email, actif):
-    NOTIF_PATH.write_text(json.dumps({"email": _texte(email), "actif": bool(actif)},
-                                     ensure_ascii=False, indent=2), encoding="utf-8")
+    _reglage_ecrire(_admin_owner(), "notif",
+                    json.dumps({"email": _texte(email), "actif": bool(actif)}, ensure_ascii=False))
 
 
 def _smtp_config():
@@ -558,28 +638,44 @@ def smtp_pret() -> bool:
     return _smtp_config() is not None
 
 
-def envoyer_mail(destinataire, sujet, corps) -> bool:
-    """Envoi best-effort ; False si SMTP non configuré, destinataire vide, ou erreur."""
+def envoyer_mail_detail(destinataire, sujet, corps):
+    """Envoie un mail. Essaie 587 (STARTTLS) puis 465 (SSL) pour contourner un
+    port bloqué. Retourne (ok, message_erreur) ; message_erreur = "" si ok."""
     cfg = _smtp_config()
-    if not cfg or not _texte(destinataire):
-        return False
-    try:
-        msg = EmailMessage()
-        msg["Subject"], msg["From"], msg["To"] = sujet, cfg["from"], destinataire
-        msg.set_content(corps)
-        ctx = ssl.create_default_context()
-        if cfg["tls"]:
-            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as srv:
-                srv.starttls(context=ctx)
-                srv.login(cfg["user"], cfg["password"])
-                srv.send_message(msg)
-        else:
-            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=15, context=ctx) as srv:
-                srv.login(cfg["user"], cfg["password"])
-                srv.send_message(msg)
-        return True
-    except Exception:
-        return False
+    if not cfg:
+        return False, "SMTP non configuré (bloc [smtp] absent des secrets)."
+    if not _texte(destinataire):
+        return False, "Adresse de destination vide."
+    # ordre d'essai : la config d'abord, puis l'autre méthode en secours
+    essais = ([("starttls", cfg["port"] or 587), ("ssl", 465)] if cfg["tls"]
+              else [("ssl", cfg["port"] or 465), ("starttls", 587)])
+    derniere = ""
+    for mode, port in essais:
+        try:
+            msg = EmailMessage()
+            msg["Subject"], msg["From"], msg["To"] = sujet, cfg["from"], destinataire
+            msg.set_content(corps)
+            ctx = ssl.create_default_context()
+            if mode == "starttls":
+                with smtplib.SMTP(cfg["host"], port, timeout=20) as srv:
+                    srv.starttls(context=ctx)
+                    srv.login(cfg["user"], cfg["password"])
+                    srv.send_message(msg)
+            else:
+                with smtplib.SMTP_SSL(cfg["host"], port, timeout=20, context=ctx) as srv:
+                    srv.login(cfg["user"], cfg["password"])
+                    srv.send_message(msg)
+            return True, ""
+        except smtplib.SMTPAuthenticationError as e:
+            return False, f"Authentification refusée (mot de passe d'application à revérifier) : {e}"
+        except Exception as e:
+            derniere = f"{type(e).__name__} : {e}"
+    return False, derniere
+
+
+def envoyer_mail(destinataire, sujet, corps) -> bool:
+    """Envoi best-effort (True/False) pour les alertes automatiques."""
+    return envoyer_mail_detail(destinataire, sujet, corps)[0]
 
 
 def notifier_admin(action: str, compte: str = None) -> bool:
@@ -1979,12 +2075,17 @@ def panneau_comptes(zone=None):
             elif not smtp_pret():
                 st.warning("L'envoi de mails n'est pas encore configuré (SMTP). Je peux te guider "
                            "pour l'activer avec ton adresse mail.")
-            elif envoyer_mail(email, "[Chiffrage CVC] Test",
-                              "Ceci est un mail de test depuis ton logiciel de chiffrage. "
-                              "Si tu le reçois, les notifications fonctionnent."):
-                st.success("Mail de test envoyé. Vérifie ta boîte.")
             else:
-                st.error("Échec de l'envoi : vérifie la configuration SMTP.")
+                ok, err = envoyer_mail_detail(
+                    email, "[Chiffrage CVC] Test",
+                    "Ceci est un mail de test depuis ton logiciel de chiffrage. "
+                    "Si tu le reçois, les notifications fonctionnent.")
+                if ok:
+                    st.success("Mail de test envoyé. Vérifie ta boîte (et les spams).")
+                else:
+                    st.error(f"Échec de l'envoi — détail : {err}")
+                    st.caption("Astuce : « Authentication » = mot de passe d'application à revérifier ; "
+                               "« Connection/timeout » = le réseau bloque le port 587 (pare-feu/antivirus/box).")
         if not smtp_pret():
             st.info("ℹ️ L'envoi de mails n'est pas encore branché. Donne-moi le feu vert et je "
                     "t'explique comment le configurer (mot de passe d'application Gmail, par ex.).")
@@ -3295,7 +3396,7 @@ def main():
         if st.button("💾 Enregistrer mon entreprise", type="primary"):
             enregistrer_entreprise(ent)
             if logo_file is not None:
-                logo_path().write_bytes(logo_file.getvalue())
+                enregistrer_logo(logo_file.getvalue())
             st.session_state["flash"] = "Fiche entreprise enregistrée."
             st.rerun()
 
