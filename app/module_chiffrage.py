@@ -759,14 +759,28 @@ COULEUR_ACCENT_DEFAUT = "#1F3864"
 MENTION_DEVIS_DEFAUT = "Devis gratuit, établi avant tout commencement des travaux."
 MENTION_ACCORD = "« Devis reçu avant l'exécution des travaux, bon pour accord »"
 
-MODELES = {"tableau": "Tableau bleu", "classique": "Classique épuré",
-           "moderne": "Moderne coloré", "compact": "Compact"}
+MODELES = {
+    "tableau": "Tableau bleu", "tableau_filets": "Tableau filets",
+    "classique": "Classique épuré", "classique_zebre": "Classique zébré",
+    "elegant": "Élégant", "entete_colore": "En-tête coloré",
+    "moderne": "Moderne coloré", "moderne_doux": "Moderne sobre",
+    "compact": "Compact", "compact_couleur": "Compact coloré",
+}
 DESCRIPTION_MODELES = {
     "tableau": "En-tête société / DEVIS, encadré DESTINATAIRE, grand tableau pleine largeur "
                "aux en-têtes sur fond de couleur (style classeur).",
+    "tableau_filets": "Même disposition que « Tableau bleu », mais en-têtes et total en filets "
+                      "de couleur plutôt qu'en aplat : plus léger.",
     "classique": "Sobre, noir et gris, sans aplat de couleur : l'accent ne sert qu'aux filets.",
-    "moderne": "Bandeau, cartouche, titres de colonnes et total TTC sur fond d'accent, lignes zébrées.",
+    "classique_zebre": "Classique, avec lignes légèrement zébrées et total TTC encadré de couleur.",
+    "elegant": "Aéré, titres de section et total TTC en couleur, bloc client encadré : rendu soigné.",
+    "entete_colore": "En-têtes de colonnes et total TTC sur fond de couleur, bloc client encadré, "
+                     "sans bandeau.",
+    "moderne": "Bandeau en haut, cartouche, titres de colonnes et total TTC sur fond d'accent, "
+               "lignes zébrées.",
+    "moderne_doux": "Comme « Moderne coloré » mais sans le bandeau du haut.",
     "compact": "Police et interlignes réduits, logo plus petit : idéal pour les devis à nombreuses lignes.",
+    "compact_couleur": "Compact, avec en-têtes de colonnes et total TTC en couleur.",
 }
 PALETTE_ACCENT = {"Bleu marine": "#1F3864", "Bleu": "#2E75B6", "Vert": "#2E7D32",
                   "Rouge brique": "#B03A2E", "Orange": "#C4501E", "Anthracite": "#3C3C3C"}
@@ -788,18 +802,29 @@ MISE_EN_FORME_DEFAUT = {
 }
 
 # Un seul moteur : un modèle n'est qu'un jeu de réglages lu par les fonctions de rendu.
-_STYLE_BASE = {"bandeau": False, "fond_cartouche": False, "fond_entete": False,
-               "fond_section": False, "fond_ttc": False, "cadre_client_accent": False,
-               "zebre": None, "echelle": 1.0, "interligne": 4.4, "marge_ligne": 3.0,
-               "logo": (55.0, 24.0)}
+# layout : "standard" (société / cartouche + client à droite) ou "tableau" (grand tableau).
+_STYLE_BASE = {"layout": "standard", "bandeau": False, "fond_cartouche": False,
+               "fond_entete": False, "fond_section": False, "fond_ttc": False,
+               "cadre_client_accent": False, "zebre": None, "echelle": 1.0,
+               "interligne": 4.4, "marge_ligne": 3.0, "logo": (55.0, 24.0)}
+_ZEBRE = (245, 246, 248)
 STYLES = {
-    "tableau": dict(_STYLE_BASE, fond_ttc=True, zebre=(245, 246, 248)),
+    "tableau": dict(_STYLE_BASE, layout="tableau", fond_entete=True, fond_ttc=True, zebre=_ZEBRE),
+    "tableau_filets": dict(_STYLE_BASE, layout="tableau"),
     "classique": dict(_STYLE_BASE),
+    "classique_zebre": dict(_STYLE_BASE, fond_ttc=True, zebre=_ZEBRE),
+    "elegant": dict(_STYLE_BASE, fond_ttc=True, fond_section=True, cadre_client_accent=True,
+                    interligne=4.8),
+    "entete_colore": dict(_STYLE_BASE, fond_entete=True, fond_ttc=True, cadre_client_accent=True),
     "moderne": dict(_STYLE_BASE, bandeau=True, fond_cartouche=True, fond_entete=True,
-                    fond_section=True, fond_ttc=True, cadre_client_accent=True,
-                    zebre=(245, 246, 248)),
+                    fond_section=True, fond_ttc=True, cadre_client_accent=True, zebre=_ZEBRE),
+    "moderne_doux": dict(_STYLE_BASE, fond_cartouche=True, fond_entete=True, fond_section=True,
+                         fond_ttc=True, cadre_client_accent=True, zebre=_ZEBRE),
     "compact": dict(_STYLE_BASE, zebre=(247, 247, 247), echelle=0.88, interligne=3.6,
                     marge_ligne=1.6, logo=(40.0, 16.0)),
+    "compact_couleur": dict(_STYLE_BASE, fond_entete=True, fond_cartouche=True, fond_ttc=True,
+                            zebre=(247, 247, 247), echelle=0.88, interligne=3.6,
+                            marge_ligne=1.6, logo=(40.0, 16.0)),
 }
 
 GRIS_TEXTE = (95, 95, 95)
@@ -1444,7 +1469,7 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None, doc
     infos = {k: _texte(v) for k, v in (infos or {}).items()}
     pdf = _PDFDevis(ent, infos, mef, document=document)
     pdf.add_page()
-    if mef["modele"] == "tableau":
+    if pdf.style["layout"] == "tableau":
         _entete_tableau_bleu(pdf, ent, infos)
         _objet_chantier(pdf, infos)
         pdf.ln(1)
@@ -1525,12 +1550,21 @@ def _entete_tableau_bleu(pdf, ent, infos):
 
 def _entete_table_tableur(pdf):
     pdf.set_x(pdf.l_margin)
-    pdf.set_fill_color(*pdf.accent)
-    pdf.set_text_color(255, 255, 255)
     pdf.police("B", 9)
-    for titre, w, _ in COLS_TABLEUR:
-        pdf.cell(w, 8, _txt(titre), border=1, fill=True, align="C")
-    pdf.ln(8)
+    y = pdf.get_y()
+    if pdf.style["fond_entete"]:   # en-têtes en aplat de couleur
+        pdf.set_fill_color(*pdf.accent)
+        pdf.set_text_color(255, 255, 255)
+        for titre, w, _ in COLS_TABLEUR:
+            pdf.cell(w, 8, _txt(titre), border=1, fill=True, align="C")
+        pdf.ln(8)
+    else:                          # en-têtes en filets de couleur
+        pdf.set_text_color(*pdf.accent)
+        for titre, w, _ in COLS_TABLEUR:
+            pdf.cell(w, 8, _txt(titre), align="C")
+        pdf.ln(8)
+        pdf.filet(y, pdf.accent, 0.4)
+        pdf.filet(y + 8, pdf.accent, 0.4)
     pdf.set_text_color(0, 0, 0)
 
 
@@ -1880,9 +1914,10 @@ def panneau_mise_en_forme(base: dict, cle: str) -> dict:
     """Choix de mise en forme, préremplis avec `base`. Retourne le dict normalisé.
     `cle` distingue les instances (entreprise, nouveau devis, devis en édition)."""
     modeles = list(MODELES)
-    modele = st.radio("Modèle de devis", modeles, index=modeles.index(base["modele"]),
-                      format_func=MODELES.get, horizontal=True, key=f"{cle}_modele")
-    st.caption(DESCRIPTION_MODELES[modele])
+    base_modele = base["modele"] if base["modele"] in modeles else modeles[0]
+    modele = st.selectbox("Modèle de devis", modeles, index=modeles.index(base_modele),
+                          format_func=MODELES.get, key=f"{cle}_modele")
+    st.caption(DESCRIPTION_MODELES.get(modele, ""))
 
     noms = list(PALETTE_ACCENT) + ["Personnalisée"]
     actuel = next((n for n, h in PALETTE_ACCENT.items() if h == base["couleur_accent"]), "Personnalisée")
