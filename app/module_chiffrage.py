@@ -759,8 +759,11 @@ COULEUR_ACCENT_DEFAUT = "#1F3864"
 MENTION_DEVIS_DEFAUT = "Devis gratuit, établi avant tout commencement des travaux."
 MENTION_ACCORD = "« Devis reçu avant l'exécution des travaux, bon pour accord »"
 
-MODELES = {"classique": "Classique épuré", "moderne": "Moderne coloré", "compact": "Compact"}
+MODELES = {"tableau": "Tableau bleu", "classique": "Classique épuré",
+           "moderne": "Moderne coloré", "compact": "Compact"}
 DESCRIPTION_MODELES = {
+    "tableau": "En-tête société / DEVIS, encadré DESTINATAIRE, grand tableau pleine largeur "
+               "aux en-têtes sur fond de couleur (style classeur).",
     "classique": "Sobre, noir et gris, sans aplat de couleur : l'accent ne sert qu'aux filets.",
     "moderne": "Bandeau, cartouche, titres de colonnes et total TTC sur fond d'accent, lignes zébrées.",
     "compact": "Police et interlignes réduits, logo plus petit : idéal pour les devis à nombreuses lignes.",
@@ -777,7 +780,7 @@ SECTIONS_DEVIS = {
     "section_mentions": "Mentions légales BTP détaillées",
 }
 MISE_EN_FORME_DEFAUT = {
-    "modele": "classique", "couleur_accent": COULEUR_ACCENT_DEFAUT,
+    "modele": "tableau", "couleur_accent": COULEUR_ACCENT_DEFAUT,
     "logo_afficher": True, "logo_position": "gauche",
     "section_validite": True, "section_accord": True, "section_options": False,
     "section_paiement": True, "section_mentions": True,
@@ -790,6 +793,7 @@ _STYLE_BASE = {"bandeau": False, "fond_cartouche": False, "fond_entete": False,
                "zebre": None, "echelle": 1.0, "interligne": 4.4, "marge_ligne": 3.0,
                "logo": (55.0, 24.0)}
 STYLES = {
+    "tableau": dict(_STYLE_BASE, fond_ttc=True, zebre=(245, 246, 248)),
     "classique": dict(_STYLE_BASE),
     "moderne": dict(_STYLE_BASE, bandeau=True, fond_cartouche=True, fond_entete=True,
                     fond_section=True, fond_ttc=True, cadre_client_accent=True,
@@ -1440,6 +1444,15 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None, doc
     infos = {k: _texte(v) for k, v in (infos or {}).items()}
     pdf = _PDFDevis(ent, infos, mef, document=document)
     pdf.add_page()
+    if mef["modele"] == "tableau":
+        _entete_tableau_bleu(pdf, ent, infos)
+        _objet_chantier(pdf, infos)
+        pdf.ln(1)
+        _table_tableur(pdf, lignes or [])
+        if document == "devis":
+            _options_variantes(pdf, infos)
+        _bloc_final(pdf, infos, totaux)
+        return bytes(pdf.output())
     _entete_page1(pdf, ent, infos)
     _objet_chantier(pdf, infos)
     pdf.ln(2)
@@ -1448,6 +1461,121 @@ def generer_pdf_devis(entreprise, infos, lignes, totaux, mise_en_forme=None, doc
         _options_variantes(pdf, infos)
     _bloc_final(pdf, infos, totaux)
     return bytes(pdf.output())
+
+
+# --- Modèle « Tableau bleu » (en-tête société/DEVIS, encadré DESTINATAIRE, grand tableau) ----
+COLS_TABLEUR = (("Désignation", 86, "L"), ("Qté", 18, "R"), ("Unité", 16, "C"),
+                ("P.U. HT (€)", 30, "R"), ("Total HT (€)", 30, "R"))
+
+
+def _entete_tableau_bleu(pdf, ent, infos):
+    """Société à gauche (avec logo), « DEVIS » + n°/dates à droite, puis encadré
+    DESTINATAIRE pleine largeur."""
+    x, haut = pdf.l_margin, pdf.get_y()
+    # logo en haut à gauche, société juste en dessous
+    taille = _taille_logo(*pdf.style["logo"]) if pdf.mef["logo_afficher"] else None
+    if taille:
+        w, h = taille
+        try:
+            pdf.image(str(logo_actuel()), x=x + pdf.c_margin, y=haut, w=w, h=h)
+            pdf.set_y(haut + h + 2)
+        except Exception:
+            pass
+    bas_gauche = _entete_entreprise(pdf, ent, x, 108)
+    # bloc DEVIS à droite
+    xd, ld = x + LARGEUR_UTILE - 70, 70.0
+    pdf.set_xy(xd, haut)
+    pdf.police("B", 22)
+    pdf.set_text_color(*pdf.accent)
+    pdf.cell(ld, 12, pdf.titre, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(70, 70, 70)
+    pdf.police("", 9)
+    droite = [f"N° {infos.get('numero', '')}", f"Date d'émission : {infos.get('date', '')}"]
+    if pdf.document == "facture":
+        droite += [f"Réf. devis {infos['reference']}" if infos.get("reference") else "",
+                   f"Échéance : {infos['echeance']}" if infos.get("echeance") else ""]
+    elif pdf.mef["section_validite"] and _validite(infos, ent):
+        droite.append(f"Valable : {_validite(infos, ent)}")
+    for ligne in [d for d in droite if d]:
+        pdf.set_x(xd)
+        pdf.cell(ld, 5, _txt(ligne), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(max(bas_gauche, pdf.get_y()) + 4)
+
+    # encadré DESTINATAIRE (pleine largeur, fond clair)
+    nom, adr, tel = infos.get("client"), infos.get("client_adresse"), infos.get("client_tel")
+    if nom or adr or tel:
+        haut_box = pdf.get_y()
+        h = 7 + 5 * max(1, _nb_lignes(pdf, nom, LARGEUR_UTILE - 4, 10, "B")) \
+            + 4.4 * _nb_lignes(pdf, adr, LARGEUR_UTILE - 4, 9) + (4.4 if tel else 0) + 3
+        pdf.set_fill_color(*_teinte(pdf.accent, 0.88))
+        pdf.set_draw_color(*_teinte(pdf.accent, 0.4))
+        pdf.rect(pdf.l_margin, haut_box, LARGEUR_UTILE, h, "DF")
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_xy(pdf.l_margin + 2, haut_box + 2)
+        pdf.police("BI", 9)
+        pdf.set_text_color(*pdf.accent)
+        pdf.cell(LARGEUR_UTILE - 4, 5, "DESTINATAIRE", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        _bloc_texte(pdf, pdf.l_margin + 2, LARGEUR_UTILE - 4, nom, 10, "B", interligne=5)
+        _bloc_texte(pdf, pdf.l_margin + 2, LARGEUR_UTILE - 4, adr, 9, interligne=4.4)
+        _bloc_texte(pdf, pdf.l_margin + 2, LARGEUR_UTILE - 4, f"Tél. {tel}" if tel else "", 9, interligne=4.4)
+        pdf.set_y(haut_box + h + 3)
+
+
+def _entete_table_tableur(pdf):
+    pdf.set_x(pdf.l_margin)
+    pdf.set_fill_color(*pdf.accent)
+    pdf.set_text_color(255, 255, 255)
+    pdf.police("B", 9)
+    for titre, w, _ in COLS_TABLEUR:
+        pdf.cell(w, 8, _txt(titre), border=1, fill=True, align="C")
+    pdf.ln(8)
+    pdf.set_text_color(0, 0, 0)
+
+
+def _table_tableur(pdf, lignes):
+    _entete_table_tableur(pdf)
+    if not lignes:
+        pdf.police("I", 9)
+        pdf.set_text_color(*GRIS_TEXTE)
+        pdf.cell(LARGEUR_UTILE, 9, "Aucune prestation chiffrée sur ce devis.", border=1,
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        return
+    wdes = COLS_TABLEUR[0][1]
+    zebre = pdf.style["zebre"]
+    for rang, lg in enumerate(lignes):
+        pdf.police("", 9)
+        desig = _txt(_texte(lg.get("designation")))
+        n = max(1, len(pdf.multi_cell(wdes - 2, 4.4, desig, dry_run=True, output="LINES")))
+        h = n * 4.4 + 3
+        if pdf.will_page_break(h):
+            pdf.add_page()
+            _entete_table_tableur(pdf)
+            pdf.police("", 9)
+        x0, y0 = pdf.l_margin, pdf.get_y()
+        if zebre and rang % 2:
+            pdf.set_fill_color(*zebre)
+            pdf.rect(x0, y0, LARGEUR_UTILE, h, "F")
+        pdf.set_draw_color(*GRIS_FILET)
+        pdf.rect(x0, y0, LARGEUR_UTILE, h)
+        xx = x0
+        for _, w, _a in COLS_TABLEUR[:-1]:
+            xx += w
+            pdf.line(xx, y0, xx, y0 + h)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_xy(x0 + 1, y0 + 1.5)
+        pdf.multi_cell(wdes - 2, 4.4, desig, align="L")
+        valeurs = (_qte(lg.get("quantite")), _texte(lg.get("unite")),
+                   pdf.euro(lg.get("prix_unitaire")), pdf.euro(montant_ligne(lg)))
+        xx = x0 + wdes
+        for (_, w, al), v in zip(COLS_TABLEUR[1:], valeurs):
+            pdf.set_xy(xx, y0)
+            pdf.cell(w, h, _txt(v), align=al)
+            xx += w
+        pdf.set_xy(x0, y0 + h)
+    pdf.ln(1)
 
 
 def _date_fr(valeur) -> str:
