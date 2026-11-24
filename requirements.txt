@@ -1,0 +1,8 @@
+streamlit==1.57.0
+pandas==3.0.2
+sqlalchemy
+psycopg2-binary
+fpdf2
+pypdfium2
+pillow
+openpyxl
