@@ -1893,6 +1893,47 @@ def _apercu_png(ent_json, mef_json, devis_json, signature_logo):
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
+def _vignette_modele(ent_json, modele, couleur, logo_sig):
+    """Petite image d'un modèle (devis d'exemple) pour la galerie de choix."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    ex = _EXEMPLE_APERCU
+    tot = calculer_totaux(ex["lignes"], 0, 10)
+    pdf = generer_pdf_devis(json.loads(ent_json), ex["infos"], ex["lignes"], tot,
+                            mise_en_forme={"modele": modele, "couleur_accent": couleur})
+    image = pdfium.PdfDocument(pdf)[0].render(scale=0.7).to_pil()
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def galerie_modeles(base, couleur, cle) -> str:
+    """Affiche une vignette par modèle ; un clic choisit. Retourne le modèle choisi."""
+    modeles = list(MODELES)
+    etat = f"{cle}_modele_sel"
+    if st.session_state.get(etat) not in modeles:
+        st.session_state[etat] = base["modele"] if base["modele"] in modeles else modeles[0]
+    st.markdown("**Modèle de devis** — clique sur une vignette pour le choisir")
+    ent_json = json.dumps(charger_entreprise(), ensure_ascii=False, sort_keys=True, default=str)
+    sig = logo_actuel().stat().st_mtime if logo_actuel().exists() else 0
+    cols = st.columns(2)
+    for i, k in enumerate(modeles):
+        with cols[i % 2]:
+            png = _vignette_modele(ent_json, k, couleur, sig)
+            if png:
+                st.image(png, use_container_width=True)
+            choisi = st.session_state[etat] == k
+            if st.button(("✅ " if choisi else "") + MODELES[k], key=f"{cle}_pick_{k}",
+                         use_container_width=True, type="primary" if choisi else "secondary"):
+                st.session_state[etat] = k
+                st.rerun()
+    st.caption(DESCRIPTION_MODELES.get(st.session_state[etat], ""))
+    return st.session_state[etat]
+
+
 def afficher_apercu(ent, mef, infos=None, lignes=None, totaux=None):
     """Aperçu de la page 1 avec les choix courants (devis réel ou exemple)."""
     if not lignes:
@@ -1913,12 +1954,7 @@ def afficher_apercu(ent, mef, infos=None, lignes=None, totaux=None):
 def panneau_mise_en_forme(base: dict, cle: str) -> dict:
     """Choix de mise en forme, préremplis avec `base`. Retourne le dict normalisé.
     `cle` distingue les instances (entreprise, nouveau devis, devis en édition)."""
-    modeles = list(MODELES)
-    base_modele = base["modele"] if base["modele"] in modeles else modeles[0]
-    modele = st.selectbox("Modèle de devis", modeles, index=modeles.index(base_modele),
-                          format_func=MODELES.get, key=f"{cle}_modele")
-    st.caption(DESCRIPTION_MODELES.get(modele, ""))
-
+    # Couleur d'abord : les vignettes des modèles s'affichent dans cette couleur.
     noms = list(PALETTE_ACCENT) + ["Personnalisée"]
     actuel = next((n for n, h in PALETTE_ACCENT.items() if h == base["couleur_accent"]), "Personnalisée")
     c1, c2 = st.columns([2, 1])
@@ -1928,6 +1964,8 @@ def panneau_mise_en_forme(base: dict, cle: str) -> dict:
     else:
         couleur = PALETTE_ACCENT[choix]
         c2.color_picker("Code couleur", couleur, disabled=True, key=f"{cle}_hex_{choix}")
+
+    modele = galerie_modeles(base, couleur, cle)
 
     c3, c4 = st.columns([1, 2])
     logo = c3.toggle("Afficher le logo", base["logo_afficher"], key=f"{cle}_logo")
