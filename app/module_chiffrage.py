@@ -2766,7 +2766,9 @@ def main():
 
     ent = charger_entreprise()
     est_admin = bool(st.session_state.get("is_admin"))
-    taux_horaire = _num(ent.get("taux_horaire"), TAUX_HORAIRE_DEFAUT) or TAUX_HORAIRE_DEFAUT
+    taux_actif = bool(ent.get("taux_horaire_actif", True))
+    taux_horaire = ((_num(ent.get("taux_horaire"), TAUX_HORAIRE_DEFAUT) or TAUX_HORAIRE_DEFAUT)
+                    if taux_actif else 0.0)
     mef_entreprise = mise_en_forme_entreprise(ent)
 
     # Chaque écran est une fonction ; le menu (en bas de main) les regroupe par usage.
@@ -3162,11 +3164,22 @@ def main():
     def ecran_tarif_horaire():
         st.caption("Sert à calculer la main-d'œuvre : temps de pose × nombre de poseurs × tarif horaire. "
                    "Un ouvrage peut avoir son propre tarif dans « Mes prix ».")
-        nouveau = st.number_input("Tarif horaire par défaut (€/h)", min_value=0.0, value=taux_horaire,
-                                  step=1.0, key="ent_taux_horaire")
+        actif = st.checkbox("Appliquer un tarif horaire général", value=taux_actif,
+                            key="ent_taux_actif",
+                            help="Décoché : le tarif général ne s'applique pas. Les ouvrages sans "
+                                 "tarif propre n'ont alors aucune main-d'œuvre ; ceux qui ont leur "
+                                 "propre tarif la gardent.")
+        valeur_defaut = _num(ent.get("taux_horaire"), TAUX_HORAIRE_DEFAUT) or TAUX_HORAIRE_DEFAUT
+        nouveau = st.number_input("Tarif horaire par défaut (€/h)", min_value=0.0,
+                                  value=valeur_defaut, step=1.0, key="ent_taux_horaire",
+                                  disabled=not actif)
+        if not actif:
+            st.info("Tarif horaire général désactivé : aucune main-d'œuvre ne sera ajoutée "
+                    "automatiquement (sauf ouvrages ayant leur propre tarif).")
         if st.button("💾 Enregistrer le tarif horaire", type="primary"):
             fichier = charger_entreprise()
             fichier["taux_horaire"] = nouveau
+            fichier["taux_horaire_actif"] = actif
             enregistrer_entreprise(fichier)
             st.session_state["flash"] = "Tarif horaire enregistré."
             st.rerun()
